@@ -1,0 +1,30 @@
+{
+  "id": "david.omastack",
+  "name": "OmaStack",
+  "tagline": "Your local development stack, one click away.",
+  "version": "0.1.1",
+  "license": "MIT",
+  "category": "Development",
+  "platforms": [
+    "Omarchy Quattro",
+    "Arch Linux",
+    "Hyprland"
+  ],
+  "entryPoints": [
+    "bar-widget",
+    "service"
+  ],
+  "keywords": [
+    "development",
+    "services",
+    "systemd",
+    "docker",
+    "health-checks",
+    "logs"
+  ],
+  "screenshots": [
+    "docs/assets/screenshots/overview-everforest.png",
+    "docs/assets/screenshots/overview-tokyo-night.png",
+    "docs/assets/screenshots/overview-catppuccin-latte.png"
+  ]
+}

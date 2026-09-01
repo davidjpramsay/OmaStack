@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "david.omastack",
+  "name": "OmaStack",
+  "version": "0.1.1",
+  "author": "David",
+  "license": "MIT",
+  "description": "Your local development stack, one click away.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "qml/BarWidget.qml",
+    "service": "qml/Service.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaStack",
+    "description": "Local development service status and controls",
+    "category": "Development",
+    "aliases": [
+      "services",
+      "dev-stack",
+      "local-stack"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showStatusCounts": true
+    },
+    "schema": [
+      {
+        "key": "showStatusCounts",
+        "type": "boolean",
+        "label": "Show four status counts",
+        "description": "Show running, stopped, unhealthy and crashed totals beside the OmaStack icon.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

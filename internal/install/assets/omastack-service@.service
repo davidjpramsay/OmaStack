@@ -1,0 +1,15 @@
+[Unit]
+Description=OmaStack managed service %i
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omastack supervise %i
+Restart=no
+KillMode=control-group
+TimeoutStopSec=310s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

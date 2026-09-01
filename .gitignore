@@ -1,0 +1,9 @@
+/bin/
+/omastack
+/dist/
+/coverage.out
+/.cache/
+*.test
+*.prof
+*.tmp
+docs/assets/screenshots/*.tmp.png
