@@ -219,6 +219,17 @@ Item {
     service.loadLogs(target, "")
   }
 
+  function openBrowserUrl(value) {
+    var target = String(value || "").trim()
+    if (!(target.indexOf("http://") === 0 || target.indexOf("https://") === 0)) {
+      if (service) service.lastError = "Only HTTP and HTTPS service URLs can be opened"
+      return
+    }
+    if (openUrlProcess.running) return
+    openUrlProcess.command = ["xdg-open", target]
+    openUrlProcess.running = true
+  }
+
   function mutateSettings(sectionName, key, value) {
     if (!service || !service.snapshot || !service.snapshot.settings) return
     var settings = JSON.parse(JSON.stringify(service.snapshot.settings))
@@ -480,7 +491,7 @@ Item {
                         onLogsRequested: function(id) { root.showLogs(id, projectDelegate.modelData.id) }
                         onEditRequested: function(id) { serviceEditor.begin(projectDelegate.modelData.id, root.serviceById(id)) }
                         onDeleteRequested: function(id) { root.requestDelete("service", id) }
-                        onOpenRequested: function(url) { openUrlProcess.command = ["xdg-open", url]; openUrlProcess.running = true }
+                        onOpenRequested: function(url) { root.openBrowserUrl(url) }
                         onDockerActionRequested: function(id, action) { root.service.dockerAction(id, action) }
                         onDockerTerminalRequested: function(id) { root.service.dockerTerminal(id) }
                       }
@@ -548,7 +559,7 @@ Item {
             delegate: Button {
               required property var modelData
               width: routeList.width; height: Style.space(48); leftAlign: true; focusable: true
-              onClicked: if (modelData.active) { openUrlProcess.command = ["xdg-open", (modelData.https ? "https://" : "http://") + modelData.hostname]; openUrlProcess.running = true }
+              onClicked: if (modelData.active) root.openBrowserUrl((modelData.https ? "https://" : "http://") + modelData.hostname)
               Item {
                 anchors.fill: parent; anchors.margins: Style.space(8)
                 StatusDot { id: routeDot; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; status: modelData.active ? "running" : "crashed" }

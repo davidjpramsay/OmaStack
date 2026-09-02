@@ -5,6 +5,10 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+- Added a browser action to compact service rows. It opens the configured
+  HTTP(S) URL or falls back to the first detected host/Docker port, and remains
+  disabled until the service is running.
+
 ## [0.1.1] - 2026-09-02
 
 - Preserved clean operator stops for Docker services even when Compose reports

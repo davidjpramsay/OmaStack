@@ -72,3 +72,37 @@ func TestQMLLogLoaderUsesConfiguredBufferSize(t *testing.T) {
 		t.Fatal("Service.qml still hardcodes the log line count")
 	}
 }
+
+func TestCompactServiceRowOffersBrowserOpen(t *testing.T) {
+	row, err := os.ReadFile(filepath.Join("..", "..", "qml", "components", "CompactServiceRow.qml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(row)
+	for _, required := range []string{
+		"readonly property string browserUrl",
+		"serviceData.url",
+		"runtimeData.ports",
+		`"http://127.0.0.1:"`,
+		"root.openRequested(root.browserUrl)",
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("CompactServiceRow.qml is missing %q", required)
+		}
+	}
+
+	panel, err := os.ReadFile(filepath.Join("..", "..", "qml", "CompactPanel.qml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	panelSource := string(panel)
+	for _, required := range []string{
+		"function openBrowserUrl(value)",
+		`openUrlProcess.command = ["xdg-open", target]`,
+		"onOpenRequested: function(url) { root.openBrowserUrl(url) }",
+	} {
+		if !strings.Contains(panelSource, required) {
+			t.Errorf("CompactPanel.qml is missing %q", required)
+		}
+	}
+}

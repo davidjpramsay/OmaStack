@@ -78,6 +78,12 @@ Tab moves through native controls, Enter/Space activates them and Escape closes
 the log view or panel. Click a project to expand it; click a service for inline
 metrics, or right-click it to edit.
 
+For a running web service, hover or keyboard-focus its row and press the globe
+button. OmaStack opens the service's configured URL, or falls back to the first
+detected host/Docker port at `http://127.0.0.1:<port>`. Set an exact URL on the
+service editor's **Web** tab when the app uses a specific path, hostname or
+HTTPS.
+
 The bar shows four small counts—running, stopped, unhealthy and crashed—next to
 the icon by default. Open the panel's gear menu and switch off **Appearance →
 Show four bar counts**, or use:

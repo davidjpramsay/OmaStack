@@ -29,6 +29,15 @@ Button {
   readonly property bool transitioning: state === "starting" || state === "stopping"
   readonly property bool hasError: (state === "crashed" || state === "unhealthy") && String(runtimeData.lastError || "") !== ""
   readonly property bool actionsVisible: pointer.hovered || activeFocus
+  readonly property string browserUrl: {
+    var configured = String(serviceData.url || "").trim()
+    if (configured !== "") return configured
+    var ports = runtimeData.ports || []
+    if (ports.length === 0) return ""
+    var port = Number(ports[0])
+    if (!isFinite(port) || Math.floor(port) !== port || port < 1 || port > 65535) return ""
+    return "http://127.0.0.1:" + String(port)
+  }
 
   function stateTextColor() {
     if (state === "crashed" || state === "unhealthy") return Color.urgent
@@ -141,6 +150,14 @@ Button {
         onClicked: root.runningState ? root.stopRequested(root.serviceData.id) : root.startRequested(root.serviceData.id)
       }
       PanelActionButton { iconText: "󰑓"; tooltipText: "Restart service"; focusable: true; onClicked: root.restartRequested(root.serviceData.id) }
+      PanelActionButton {
+        visible: root.browserUrl !== ""
+        iconText: "󰖟"
+        tooltipText: root.runningState ? "Open service in browser" : "Start service before opening"
+        enabled: root.runningState && !root.transitioning
+        focusable: true
+        onClicked: root.openRequested(root.browserUrl)
+      }
       PanelActionButton { iconText: "󰆍"; tooltipText: "View logs"; focusable: true; onClicked: root.logsRequested(root.serviceData.id) }
       PanelActionButton { iconText: "󰏫"; tooltipText: "Edit service"; focusable: true; onClicked: root.editRequested(root.serviceData.id) }
       PanelActionButton { iconText: "󰆴"; tooltipText: "Delete service"; hoverColor: Color.urgent; focusable: true; onClicked: root.deleteRequested(root.serviceData.id) }
