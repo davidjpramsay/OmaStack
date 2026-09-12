@@ -58,8 +58,13 @@ func (s *ConfigStore) Get() model.Config {
 func (s *ConfigStore) Update(mutator func(*model.Config) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.config
-	data, _ := json.Marshal(s.config)
+	// Decode into independent storage: decoding over a shallow copy reuses
+	// slices/maps and leaks rejected mutations into the live configuration.
+	var next model.Config
+	data, err := json.Marshal(s.config)
+	if err != nil {
+		return err
+	}
 	if err := json.Unmarshal(data, &next); err != nil {
 		return err
 	}

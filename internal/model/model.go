@@ -158,6 +158,7 @@ type MetricsPoint struct {
 }
 
 type ServiceRuntime struct {
+	Stale           bool           `json:"stale,omitempty"`
 	ServiceID       string         `json:"serviceId"`
 	ProjectID       string         `json:"projectId"`
 	Status          ServiceStatus  `json:"status"`
@@ -193,6 +194,7 @@ type Snapshot struct {
 }
 
 type ActiveRoute struct {
+	URL      string `json:"url"`
 	Hostname string `json:"hostname"`
 	Target   string `json:"target"`
 	HTTPS    bool   `json:"https"`

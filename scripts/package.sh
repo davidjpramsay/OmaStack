@@ -7,7 +7,7 @@ archive_name="OmaStack-$version.tar.gz"
 output="${1:-$project_dir/dist/$archive_name}"
 
 git -C "$project_dir" rev-parse --verify HEAD >/dev/null
-if ! git -C "$project_dir" diff --quiet || ! git -C "$project_dir" diff --cached --quiet; then
+if [[ -n $(git -C "$project_dir" status --porcelain --untracked-files=all) ]]; then
   echo "package: refusing to archive a dirty working tree" >&2
   exit 1
 fi

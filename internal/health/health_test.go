@@ -6,9 +6,23 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"omastack/internal/model"
 )
+
+func TestProbeTimeoutIncludesSemaphoreQueue(t *testing.T) {
+	checker := NewChecker(1)
+	checker.semaphore <- struct{}{}
+	defer func() { <-checker.semaphore }()
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := checker.Check(ctx, model.HealthCheck{Type: "command", TimeoutSeconds: 1, Command: &model.CommandSpec{Executable: "/usr/bin/true"}})
+	if err == nil || ctx.Err() != nil || time.Since(started) > 2*time.Second {
+		t.Fatalf("queue outlived check budget: %v (%v)", err, time.Since(started))
+	}
+}
 
 func TestHealthTransitions(t *testing.T) {
 	state := Transition(State{}, false, 2, "down")
@@ -22,6 +36,27 @@ func TestHealthTransitions(t *testing.T) {
 	state = Transition(state, true, 2, "")
 	if state.Status != "healthy" || state.Failures != 0 || state.LastError != "" {
 		t.Fatalf("recovery = %#v", state)
+	}
+}
+
+func TestRegistryRejectsPreviousRunAndInFlightResults(t *testing.T) {
+	r := NewRegistry()
+	_, old := r.Observe("api", "run-one")
+	if !r.Commit("api", old, State{Status: "healthy"}) {
+		t.Fatal("current result rejected")
+	}
+	state, current := r.Observe("api", "run-two")
+	if state.Status != "" {
+		t.Fatal("old health survived new run")
+	}
+	for _, status := range []string{"healthy", "unhealthy"} {
+		if r.Commit("api", old, State{Status: status}) {
+			t.Fatal("stale in-flight result accepted")
+		}
+	}
+	r.Reset("api")
+	if r.Commit("api", current, State{Status: "healthy"}) {
+		t.Fatal("stopped service accepted result")
 	}
 }
 

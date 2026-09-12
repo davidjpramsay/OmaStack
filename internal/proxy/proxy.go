@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type Manager struct {
 	address   string
 	lastError string
 	requests  chan struct{}
+	port      int
 }
 
 func New(resolve PortResolver) *Manager {
@@ -47,7 +49,7 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 			if service.Route == nil {
 				continue
 			}
-			host := strings.ToLower(strings.TrimSuffix(service.Route.Hostname, "."))
+			host := validate.CanonicalHostname(service.Route.Hostname)
 			if !validate.LocalHostname(host) {
 				return fmt.Errorf("invalid route hostname %q", host)
 			}
@@ -59,6 +61,7 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 	}
 	m.mu.Lock()
 	m.routes = routes
+	m.port = settings.HTTPPort
 	m.mu.Unlock()
 	if !settings.Enabled {
 		return m.Close()
@@ -90,7 +93,12 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 	m.mu.Unlock()
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			m.setError(err.Error())
+			m.mu.Lock()
+			if m.server == server {
+				m.lastError = err.Error()
+				m.listener = nil
+			}
+			m.mu.Unlock()
 		}
 	}()
 	return nil
@@ -109,7 +117,7 @@ func (m *Manager) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if parsedHost, _, err := net.SplitHostPort(request.Host); err == nil {
 		host = parsedHost
 	}
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	host = validate.CanonicalHostname(host)
 	if !validate.LocalHostname(host) {
 		http.Error(writer, "Unknown OmaStack route", http.StatusMisdirectedRequest)
 		return
@@ -166,15 +174,18 @@ func (m *Manager) Routes() []model.ActiveRoute {
 		if m.resolve != nil {
 			port, active = m.resolve(target.serviceID, target.port)
 		}
-		route := model.ActiveRoute{Hostname: host, Active: active}
+		route := model.ActiveRoute{Hostname: host, URL: "http://" + net.JoinHostPort(host, strconv.Itoa(m.port)), Active: active && validate.Port(port) && m.listener != nil}
 		if port > 0 {
 			route.Target = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 		}
-		if !active {
+		if m.listener == nil {
+			route.Error = "proxy is disabled or its listener is unavailable"
+		} else if !route.Active {
 			route.Error = "target is not running or has no detected port"
 		}
 		result = append(result, route)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Hostname < result[j].Hostname })
 	return result
 }
 

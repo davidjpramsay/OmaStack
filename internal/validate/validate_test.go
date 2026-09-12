@@ -84,3 +84,48 @@ func TestDockerServiceDoesNotRequireHostCommand(t *testing.T) {
 		t.Fatalf("Docker and shell combination accepted: %v", err)
 	}
 }
+
+func TestConfigRejectsCyclesAndMissingReadiness(t *testing.T) {
+	c := model.DefaultConfig()
+	p, _ := NewID()
+	a, _ := NewID()
+	b, _ := NewID()
+	service := func(id string) model.Service {
+		return model.Service{ID: id, Name: id, WorkingDirectory: "/tmp", Command: model.CommandSpec{Executable: "/usr/bin/true"}, Restart: model.RestartPolicy{Mode: "never"}, StopSignal: "SIGTERM", GracefulStopSeconds: 10}
+	}
+	c.Projects = []model.Project{{ID: p, Name: "graph", Services: []model.Service{service(a), service(b)}}}
+	c.Projects[0].Services[0].Dependencies = []model.Dependency{{ServiceID: b, Condition: "started"}}
+	if err := Config(c); err != nil {
+		t.Fatal(err)
+	}
+	c.Projects[0].Services[1].Dependencies = []model.Dependency{{ServiceID: a, Condition: "started"}}
+	if err := Config(c); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cycle accepted: %v", err)
+	}
+	c.Projects[0].Services[1].Dependencies = nil
+	c.Projects[0].Services[0].Dependencies[0].Condition = "healthy"
+	if err := Config(c); err == nil || !strings.Contains(err.Error(), "no health check") {
+		t.Fatalf("missing readiness accepted: %v", err)
+	}
+	c.Projects[0].Services[1].Docker = &model.DockerSpec{ComposeFile: "/tmp/compose.yaml", Service: "db"}
+	if err := Config(c); err != nil {
+		t.Fatalf("native Docker readiness rejected: %v", err)
+	}
+}
+
+func TestRouteUniquenessUsesCanonicalHostname(t *testing.T) {
+	for _, alternate := range []string{"APP.localhost.", " app.localhost "} {
+		c := model.DefaultConfig()
+		p, _ := NewID()
+		a, _ := NewID()
+		b, _ := NewID()
+		service := model.Service{ID: a, Name: "a", Command: model.CommandSpec{Executable: "/usr/bin/true"}, WorkingDirectory: "/tmp", Restart: model.RestartPolicy{Mode: "never"}, StopSignal: "SIGTERM", GracefulStopSeconds: 10, Route: &model.Route{Hostname: "app.localhost"}}
+		other := service
+		other.ID = b
+		other.Route = &model.Route{Hostname: alternate}
+		c.Projects = []model.Project{{ID: p, Name: "routes", Services: []model.Service{service, other}}}
+		if err := Config(c); err == nil || !strings.Contains(err.Error(), "route") {
+			t.Fatalf("equivalent hostname accepted: %q %v", alternate, err)
+		}
+	}
+}

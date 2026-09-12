@@ -17,6 +17,7 @@ Item {
   function repaint() { if (updatesEnabled) canvas.requestPaint() }
   onSamplesChanged: repaint()
   onValueKeyChanged: repaint()
+  onMaxSamplesChanged: repaint()
   onWidthChanged: repaint()
   onHeightChanged: repaint()
   onUpdatesEnabledChanged: if (updatesEnabled) repaint()

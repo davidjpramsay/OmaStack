@@ -9,6 +9,7 @@ Button {
   property var runtimeData: ({ status: "stopped", cpu: 0, memoryMb: 0, ports: [], history: [] })
   property bool expanded: false
   property bool panelVisible: true
+  property int historySamples: 60
   property color projectColor: Color.accent
   signal startRequested(string serviceId)
   signal stopRequested(string serviceId)
@@ -78,7 +79,7 @@ Button {
       anchors.top: parent.top
       spacing: Style.space(5)
       MetricPill { iconText: "󰍛"; label: Number(root.runtimeData.cpu || 0).toFixed(1) + "%" }
-      MetricPill { iconText: "󰘚"; label: Number(root.runtimeData.memoryMb || 0).toFixed(0) + " MB" }
+      MetricPill { iconText: "󰘚"; label: Number(root.runtimeData.memoryMb || 0).toFixed(0) + " MiB" }
       MetricPill {
         visible: Boolean(root.runtimeData.ports && root.runtimeData.ports.length > 0)
         iconText: "󰘖"
@@ -143,6 +144,7 @@ Button {
         width: parent.chartWidth
         height: parent.height
         samples: root.runtimeData.history || []
+        maxSamples: root.historySamples
         valueKey: "cpu"
         lineColor: root.projectColor
         updatesEnabled: root.panelVisible
@@ -154,6 +156,7 @@ Button {
         width: parent.chartWidth
         height: parent.height
         samples: root.runtimeData.history || []
+        maxSamples: root.historySamples
         valueKey: "memoryMb"
         lineColor: Color.muted
         updatesEnabled: root.panelVisible

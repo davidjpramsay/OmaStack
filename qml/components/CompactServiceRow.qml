@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as Controls
 import qs.Commons
 import qs.Ui
 import "."
@@ -10,6 +11,8 @@ Button {
   property var runtimeData: ({ status: "stopped", cpu: 0, memoryMb: 0, ports: [], history: [] })
   property bool expanded: false
   property bool panelVisible: true
+  property int historySamples: 60
+  property string routeUrl: ""
   property color projectColor: Color.accent
   property color primaryText: Color.popups.text
   property color secondaryText: Qt.tint(Color.popups.background, Util.alpha(primaryText, 0.82))
@@ -23,30 +26,33 @@ Button {
   signal deleteRequested(string serviceId)
   signal dockerActionRequested(string serviceId, string action)
   signal dockerTerminalRequested(string serviceId)
+  signal forceKillRequested(string serviceId)
 
-  readonly property string state: String(runtimeData.status || "stopped")
-  readonly property bool runningState: state === "running" || state === "unhealthy"
-  readonly property bool transitioning: state === "starting" || state === "stopping"
-  readonly property bool hasError: (state === "crashed" || state === "unhealthy") && String(runtimeData.lastError || "") !== ""
-  readonly property bool actionsVisible: pointer.hovered || activeFocus
+  readonly property string serviceState: String(runtimeData.status || "stopped")
+  readonly property bool runningState: serviceState === "running" || serviceState === "unhealthy"
+  readonly property bool transitioning: serviceState === "starting" || serviceState === "stopping"
+  readonly property bool hasError: (serviceState === "crashed" || serviceState === "unhealthy") && String(runtimeData.lastError || "") !== ""
+  readonly property bool actionsVisible: true
+  readonly property bool canStop: runningState || serviceState === "starting"
   readonly property string browserUrl: {
     var configured = String(serviceData.url || "").trim()
     if (configured !== "") return configured
-    var ports = runtimeData.ports || []
-    if (ports.length === 0) return ""
-    var port = Number(ports[0])
-    if (!isFinite(port) || Math.floor(port) !== port || port < 1 || port > 65535) return ""
-    return "http://127.0.0.1:" + String(port)
+    return routeUrl
+  }
+
+  function openPort(port) {
+    port = Number(port)
+    if (isFinite(port) && Math.floor(port) === port && port > 0 && port <= 65535) root.openRequested("http://127.0.0.1:" + String(port))
   }
 
   function stateTextColor() {
-    if (state === "crashed" || state === "unhealthy") return Color.urgent
-    if (state === "running" || state === "starting" || state === "stopping") return Color.accent
+    if (serviceState === "crashed" || serviceState === "unhealthy") return Color.urgent
+    if (serviceState === "running" || serviceState === "starting" || serviceState === "stopping") return Color.accent
     return secondaryText
   }
 
   width: parent ? parent.width : implicitWidth
-  height: expanded ? Style.space(82) : (hasError ? Style.space(46) : Style.space(34))
+  height: Style.space((expanded ? 82 : 34) + (hasError ? 18 : 0))
   leftAlign: true
   focusable: true
   selected: false
@@ -57,7 +63,7 @@ Button {
   verticalPadding: 0
   text: ""
   iconText: ""
-  Accessible.name: (root.serviceData.name || "Unnamed service") + ", " + root.state
+  Accessible.name: (root.serviceData.name || "Unnamed service") + ", " + root.serviceState
   Accessible.description: "Open service metrics and controls"
   onRightClicked: root.editRequested(root.serviceData.id)
 
@@ -75,7 +81,7 @@ Button {
       anchors.left: parent.left
       anchors.top: parent.top
       anchors.topMargin: Style.space(14)
-      status: root.state
+      status: root.serviceState
       dotSize: Style.space(5)
     }
 
@@ -113,7 +119,7 @@ Button {
       Text { textFormat: Text.PlainText; visible: root.runningState; text: "·"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.caption }
       Text { textFormat: Text.PlainText;
         visible: root.runningState
-        text: Number(root.runtimeData.memoryMb || 0).toFixed(0) + "MB"
+        text: Number(root.runtimeData.memoryMb || 0).toFixed(0) + "MiB"
         color: root.secondaryText
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
@@ -127,7 +133,7 @@ Button {
       }
       Text { textFormat: Text.PlainText;
         visible: !root.runningState
-        text: root.state.charAt(0).toUpperCase() + root.state.slice(1)
+        text: root.serviceState.charAt(0).toUpperCase() + root.serviceState.slice(1)
         color: root.stateTextColor()
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
@@ -143,28 +149,25 @@ Button {
       spacing: Style.space(2)
 
       PanelActionButton {
-        iconText: root.runningState ? "󰓛" : "󰐊"
-        tooltipText: root.runningState ? "Stop service" : "Start service"
-        enabled: !root.transitioning
+        iconText: root.canStop ? "󰓛" : "󰐊"
+        tooltipText: root.serviceState === "starting" ? "Cancel startup / stop service" : (root.canStop ? "Stop service" : "Start service")
+        enabled: root.serviceState !== "stopping"
         focusable: true
-        onClicked: root.runningState ? root.stopRequested(root.serviceData.id) : root.startRequested(root.serviceData.id)
+        onClicked: root.canStop ? root.stopRequested(root.serviceData.id) : root.startRequested(root.serviceData.id)
       }
-      PanelActionButton { iconText: "󰑓"; tooltipText: "Restart service"; focusable: true; onClicked: root.restartRequested(root.serviceData.id) }
       PanelActionButton {
-        visible: root.browserUrl !== ""
+        id: browserButton
         iconText: "󰖟"
-        tooltipText: root.runningState ? "Open service in browser" : "Start service before opening"
+        tooltipText: root.browserUrl !== "" ? "Open service in browser" : "Choose a port or set a browser URL"
         enabled: root.runningState && !root.transitioning
         focusable: true
-        onClicked: root.openRequested(root.browserUrl)
+        onClicked: root.browserUrl !== "" ? root.openRequested(root.browserUrl) : portMenu.open()
       }
-      PanelActionButton { iconText: "󰆍"; tooltipText: "View logs"; focusable: true; onClicked: root.logsRequested(root.serviceData.id) }
-      PanelActionButton { iconText: "󰏫"; tooltipText: "Edit service"; focusable: true; onClicked: root.editRequested(root.serviceData.id) }
-      PanelActionButton { iconText: "󰆴"; tooltipText: "Delete service"; hoverColor: Color.urgent; focusable: true; onClicked: root.deleteRequested(root.serviceData.id) }
+      PanelActionButton { id: moreButton; iconText: "󰇙"; tooltipText: "More service actions"; focusable: true; onClicked: actionsMenu.open() }
     }
 
     Text { textFormat: Text.PlainText;
-      visible: root.hasError && !root.expanded
+      visible: root.hasError
       anchors.left: serviceName.left
       anchors.right: parent.right
       anchors.top: parent.top
@@ -196,7 +199,7 @@ Button {
             Item { width: parent.width - cpuLabel.width - cpuValue.width; height: 1 }
             Text { textFormat: Text.PlainText; id: cpuValue; text: Number(root.runtimeData.cpu || 0).toFixed(1) + "%"; color: root.primaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true }
           }
-          Sparkline { width: parent.width; height: Style.space(30); samples: root.runtimeData.history || []; valueKey: "cpu"; lineColor: root.projectColor; updatesEnabled: root.panelVisible }
+          Sparkline { width: parent.width; height: Style.space(30); samples: root.runtimeData.history || []; maxSamples: root.historySamples; valueKey: "cpu"; lineColor: root.projectColor; updatesEnabled: root.panelVisible }
         }
         Column {
           width: (parent.width - parent.spacing) / 2
@@ -205,11 +208,64 @@ Button {
             width: parent.width
             Text { textFormat: Text.PlainText; id: memLabel; text: "MEM"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true }
             Item { width: parent.width - memLabel.width - memValue.width; height: 1 }
-            Text { textFormat: Text.PlainText; id: memValue; text: Number(root.runtimeData.memoryMb || 0).toFixed(0) + " MB"; color: root.primaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true }
+            Text { textFormat: Text.PlainText; id: memValue; text: Number(root.runtimeData.memoryMb || 0).toFixed(0) + " MiB"; color: root.primaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true }
           }
-          Sparkline { width: parent.width; height: Style.space(30); samples: root.runtimeData.history || []; valueKey: "memoryMb"; lineColor: root.secondaryText; updatesEnabled: root.panelVisible }
+          Sparkline { width: parent.width; height: Style.space(30); samples: root.runtimeData.history || []; maxSamples: root.historySamples; valueKey: "memoryMb"; lineColor: root.secondaryText; updatesEnabled: root.panelVisible }
         }
       }
+    }
+  }
+
+  Controls.Popup {
+    id: actionsMenu
+    parent: root
+    x: Math.max(0, root.width-width); y: Style.space(30)
+    width: Style.space(220)
+    padding: Style.space(5)
+    modal: false; focus: true
+    background: BorderSurface { color: Color.popups.background; borderSpec: Border.flat(Color.popups.border, Style.normalBorderWidth); radius: Style.cornerRadius }
+    contentItem: Column {
+      spacing: Style.space(2)
+      Repeater {
+        model: [
+          {label:"Restart", action:"restart"}, {label:"View logs", action:"logs"}, {label:"Edit service", action:"edit"},
+          {label:"Force kill…", action:"kill"}, {label:"Delete service…", action:"delete"}
+        ].concat(root.serviceData.docker ? [{label:"Rebuild container",action:"rebuild"},{label:"Recreate container",action:"recreate"},{label:"Container terminal",action:"terminal"}] : [])
+        Button {
+          required property var modelData
+          width: parent.width; text: modelData.label; leftAlign: true; focusable: true
+          onClicked: {
+            actionsMenu.close()
+            var id = root.serviceData.id
+            switch (modelData.action) {
+              case "restart": root.restartRequested(id); break
+              case "logs": root.logsRequested(id); break
+              case "edit": root.editRequested(id); break
+              case "kill": root.forceKillRequested(id); break
+              case "delete": root.deleteRequested(id); break
+              case "terminal": root.dockerTerminalRequested(id); break
+              default: root.dockerActionRequested(id, modelData.action)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Controls.Popup {
+    id: portMenu
+    parent: root
+    x: Math.max(0, root.width-width); y: Style.space(30)
+    width: Style.space(250); padding: Style.space(7); focus: true
+    background: BorderSurface { color: Color.popups.background; borderSpec: Border.flat(Color.popups.border, Style.normalBorderWidth); radius: Style.cornerRadius }
+    contentItem: Column {
+      spacing: Style.space(4)
+      Text { textFormat: Text.PlainText; width: parent.width; text: "Detected TCP ports may not serve HTTP. Set a URL for one-click access."; wrapMode: Text.WordWrap; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+      Repeater {
+        model: root.runtimeData.ports || []
+        Button { required property var modelData; width: parent.width; text: "Open port " + modelData + " as HTTP"; focusable: true; onClicked: { portMenu.close(); root.openPort(modelData) } }
+      }
+      Button { width: parent.width; text: "Set browser URL…"; focusable: true; onClicked: { portMenu.close(); root.editRequested(root.serviceData.id) } }
     }
   }
 }

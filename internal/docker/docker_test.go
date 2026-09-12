@@ -35,8 +35,11 @@ case "$*" in
     cat >/dev/null
     echo '{"services":{"api":{"command":["serve","--port","3000"],"ports":[{"published":"3000","target":3000}]}}}'
     ;;
-  *" ps --format json api")
+  *" ps --all --format json api")
     echo '[{"ID":"container-id","Name":"stack-api-1","State":"running","Health":"healthy","ExitCode":0,"Publishers":[{"PublishedPort":3000}]}]'
+    ;;
+  "inspect --format {{json .State}} container-id")
+    echo '{"Status":"running","StartedAt":"2026-09-08T01:00:00Z","ExitCode":0,"Health":{"Status":"healthy"}}'
     ;;
   "stats --no-stream --format {{json .}} container-id")
     echo '{"CPUPerc":"2.5%","MemUsage":"32MiB / 1GiB"}'
@@ -75,7 +78,7 @@ func TestDockerCommandWorkflows(t *testing.T) {
 		t.Fatalf("imported=%#v err=%v", imported, err)
 	}
 	state, err := Inspect(ctx, composePath, "stack", "api")
-	if err != nil || state.ID != "container-id" || state.State != "running" || state.CPU != 2.5 || state.MemoryMB != 32 || !reflect.DeepEqual(state.Published, []int{3000}) {
+	if err != nil || state.ID != "container-id" || state.State != "running" || state.StartedAt.IsZero() || state.CPU != 2.5 || state.MemoryMB != 32 || !reflect.DeepEqual(state.Published, []int{3000}) {
 		t.Fatalf("state=%#v err=%v", state, err)
 	}
 	for _, action := range []string{"start", "stop", "restart", "rebuild", "recreate"} {
@@ -99,7 +102,7 @@ func TestDockerCommandWorkflows(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for _, expected := range []string{"config --no-interpolate", "--project-name stack ps", "stats --no-stream", "up --detach --no-build", "build api", "--force-recreate", "xdg-terminal-exec docker compose"} {
+	for _, expected := range []string{"config --no-interpolate", "--project-name stack ps --all", "stats --no-stream", "up --detach --no-build --no-deps api", "restart --no-deps api", "build api", "--force-recreate --no-deps api", "xdg-terminal-exec docker compose"} {
 		if !strings.Contains(string(calls), expected) {
 			t.Errorf("missing %q in calls:\n%s", expected, calls)
 		}

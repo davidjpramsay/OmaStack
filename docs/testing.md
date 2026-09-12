@@ -1,9 +1,30 @@
 # Verification record
 
+Latest source/security-fix verification:
+[2026-09-12](security-fix-verification-2026-09-12.md), including a real isolated
+Docker/systemd shutdown regression. Historical results below retain their dates.
+
+Latest native integration acceptance: [2026-09-12](native-acceptance-2026-09-12.md).
+The records below describe earlier verification, not a substitute for checking
+the actual widget binding with `bash scripts/check-live.sh`.
+
 Date: 2026-09-02
 
 Machine: Omarchy 4.0.2-1, Quickshell 0.3.1, systemd 261.2,
 Linux 7.1.9-arch1-2 x86-64
+
+## Follow-up memory verification
+
+Date: 2026-09-04
+
+The host-service sampler now prefers cgroup-v2 `memory.current`, falls back to
+process proportional set size (PSS) when cgroup accounting is unavailable, and
+uses summed RSS only when neither accurate source can be read. Focused tests
+cover all three paths. The complete suite, race-enabled suite and `go vet ./...`
+passed after the change. The rebuilt daemon was then installed and restarted;
+for the running AniMauth service, OmaStack reported about 82.64 MiB while
+systemd reported `MemoryCurrent=86650880` (also about 82.64 MiB). Mauth Dev was
+stopped, so no additional development workload was started for verification.
 
 ## Automated gates
 

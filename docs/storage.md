@@ -8,7 +8,7 @@ plugin checkout.
 | `$XDG_CONFIG_HOME/omastack/config.json` | `0600` | Projects, services, secrets and settings | Preserved by disable/uninstall; removed only by confirmed purge |
 | `$XDG_CONFIG_HOME/omastack/exports/*.json` | `0600` | User-requested configuration backups | Preserved unless purged |
 | `$XDG_RUNTIME_DIR/omastack/control.sock` | `0600` | Same-user local control API | Removed when the daemon stops |
-| `$XDG_RUNTIME_DIR/omastack/state.json` | `0600` | Redacted shell snapshot | Removed when the daemon stops |
+| `$XDG_RUNTIME_DIR/omastack/state.json` | `0600` | Redacted shell snapshot | Retained as a stale/offline view when the daemon stops; replaced atomically on next update |
 | `$XDG_STATE_HOME/omastack/services/*.json` | `0600` | Durable supervisor PID/exit/restart records | Cleaned explicitly or purged |
 | `$XDG_CACHE_HOME/omastack/` | `0700` directory | Reserved bounded cache | Purged on request |
 | `~/.local/bin/omastack` | `0755` | Native CLI/backend binary | Removed by `omastack uninstall` |

@@ -45,9 +45,10 @@ type TargetParams struct {
 	Target string `json:"target"`
 }
 type LogsParams struct {
-	Target string `json:"target"`
-	Lines  int    `json:"lines"`
-	Query  string `json:"query,omitempty"`
+	Target   string `json:"target"`
+	Lines    int    `json:"lines"`
+	Query    string `json:"query,omitempty"`
+	Metadata bool   `json:"metadata,omitempty"`
 }
 
 func ValidateRequest(request Request) error {

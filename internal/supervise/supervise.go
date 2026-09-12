@@ -101,17 +101,26 @@ func runOnce(ctx context.Context, resolved paths.Paths, service model.Service, r
 	cmd.Dir = service.WorkingDirectory
 	cmd.Env = environment
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stdout, err := cmd.StdoutPipe()
+	// Own the read ends: exec.Cmd.Wait must not close them before the log
+	// readers have drained the child's final output.
+	stdout, stdoutWrite, err := os.Pipe()
 	if err != nil {
 		return 126, "", err
 	}
-	stderr, err := cmd.StderrPipe()
+	defer stdout.Close()
+	defer stdoutWrite.Close()
+	stderr, stderrWrite, err := os.Pipe()
 	if err != nil {
 		return 126, "", err
 	}
+	defer stderr.Close()
+	defer stderrWrite.Close()
+	cmd.Stdout, cmd.Stderr = stdoutWrite, stderrWrite
 	if err := cmd.Start(); err != nil {
 		return exitCode(err), "", err
 	}
+	_ = stdoutWrite.Close()
+	_ = stderrWrite.Close()
 
 	record.PID = cmd.Process.Pid
 	record.StartedAt = &started
@@ -141,14 +150,33 @@ func runOnce(ctx context.Context, resolved paths.Paths, service model.Service, r
 			forward = syscall.SIGKILL
 		}
 		_ = syscall.Kill(-cmd.Process.Pid, forward)
-		waitErr = waitWithTimeout(waited, cmd.Process.Pid, time.Duration(service.GracefulStopSeconds)*time.Second)
+		waitErr = waitWithTimeout(waited, cmd.Process.Pid, shutdownWait(service))
 	case <-ctx.Done():
 		_ = syscall.Kill(-cmd.Process.Pid, signalFor(service.StopSignal))
-		waitErr = waitWithTimeout(waited, cmd.Process.Pid, time.Duration(service.GracefulStopSeconds)*time.Second)
+		waitErr = waitWithTimeout(waited, cmd.Process.Pid, shutdownWait(service))
 	}
-	outputWG.Wait()
+	drained := make(chan struct{})
+	go func() { outputWG.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		// An orphan descendant may retain an inherited descriptor indefinitely.
+		_ = stdout.Close()
+		_ = stderr.Close()
+		<-drained
+	}
 	code := exitCode(waitErr)
 	return code, exitSignal(waitErr), waitErr
+}
+
+func shutdownWait(service model.Service) time.Duration {
+	wait := time.Duration(service.GracefulStopSeconds) * time.Second
+	if service.Docker != nil {
+		// Compose applies the configured grace to the container. Give its CLI
+		// time to receive Docker's completion rather than racing the same timer.
+		wait += 5 * time.Second
+	}
+	return wait
 }
 
 func commandFor(service model.Service) (string, []string, error) {
@@ -157,7 +185,9 @@ func commandFor(service model.Service) (string, []string, error) {
 		if service.Docker.ProjectName != "" {
 			args = append(args, "--project-name", service.Docker.ProjectName)
 		}
-		args = append(args, "up", "--no-color", "--no-build", service.Docker.Service)
+		// Dependencies have their own supervisors. Attaching them here would
+		// let stopping this one service also stop shared dependency containers.
+		args = append(args, "up", "--no-color", "--no-build", "--no-deps", "--timeout", fmt.Sprint(service.GracefulStopSeconds), service.Docker.Service)
 		return "docker", args, nil
 	}
 	if service.Shell != nil && service.Shell.Enabled {
@@ -171,13 +201,48 @@ func commandFor(service model.Service) (string, []string, error) {
 
 func copyStream(wg *sync.WaitGroup, destination io.Writer, stream string, source io.Reader, secrets []string) {
 	defer wg.Done()
-	scanner := bufio.NewScanner(source)
-	scanner.Buffer(make([]byte, 4096), 1<<20)
-	for scanner.Scan() {
-		fmt.Fprintf(destination, "%s\t%s\n", stream, redact.Text(scanner.Text(), secrets))
-	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
-		fmt.Fprintf(os.Stderr, "omastack-log\t%s stream error: %v\n", stream, err)
+	reader := bufio.NewReaderSize(source, 4096)
+	line := make([]byte, 0, 4096)
+	oversized := false
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if !oversized {
+			if len(line)+len(fragment) > 1<<20 {
+				// Never emit a prefix: a secret may straddle the truncation point.
+				oversized = true
+				line = line[:0]
+			} else {
+				line = append(line, fragment...)
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			// A failed/closed read may end halfway through a secret. Discard
+			// that incomplete line instead of treating it as a complete record.
+			if len(line) > 0 || oversized {
+				fmt.Fprintf(destination, "%s\t[OmaStack: incomplete log line omitted]\n", stream)
+			}
+			if !errors.Is(err, os.ErrClosed) {
+				fmt.Fprintf(os.Stderr, "omastack-log\t%s stream error: %v\n", stream, err)
+			}
+			return
+		}
+		if oversized {
+			fmt.Fprintf(destination, "%s\t[OmaStack: oversized log line omitted (>1 MiB)]\n", stream)
+		} else if len(line) > 0 {
+			value := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+			fmt.Fprintf(destination, "%s\t%s\n", stream, redact.Text(value, secrets))
+		}
+		line = line[:0]
+		oversized = false
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
+				fmt.Fprintf(os.Stderr, "omastack-log\t%s stream error: %v\n", stream, err)
+			}
+			return
+		}
 	}
 }
 

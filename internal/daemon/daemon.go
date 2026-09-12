@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -42,11 +43,13 @@ type Daemon struct {
 	lastPortPoll   map[string]time.Time
 	lastDockerPoll map[string]time.Time
 	dockerStates   map[string]docker.ContainerState
-	healthRunning  map[string]bool
+	healthRunning  map[string]uint64
+	autostartError string
 	previousStatus map[string]model.ServiceStatus
 	panelOpen      bool
 	listener       net.Listener
 	workers        chan struct{}
+	logWorkers     chan struct{}
 }
 
 func New(resolved paths.Paths) (*Daemon, error) {
@@ -67,9 +70,10 @@ func New(resolved paths.Paths) (*Daemon, error) {
 		lastPortPoll:   map[string]time.Time{},
 		lastDockerPoll: map[string]time.Time{},
 		dockerStates:   map[string]docker.ContainerState{},
-		healthRunning:  map[string]bool{},
+		healthRunning:  map[string]uint64{},
 		previousStatus: map[string]model.ServiceStatus{},
 		workers:        make(chan struct{}, 32),
+		logWorkers:     make(chan struct{}, 2),
 	}
 	d.proxy = proxy.New(d.resolveProxyPort)
 	return d, nil
@@ -78,8 +82,6 @@ func New(resolved paths.Paths) (*Daemon, error) {
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.configureProxy(); err != nil { /* reported through diagnostics */
 	}
-	d.reconcile(ctx)
-	d.startAutostart(ctx)
 	listener, err := listen(d.paths.SocketFile)
 	if err != nil {
 		return err
@@ -90,7 +92,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer func() {
 		listener.Close()
 		_ = os.Remove(d.paths.SocketFile)
-		_ = os.Remove(d.paths.SnapshotFile)
+		// Keep definitions visible, but never present a stopped daemon's last
+		// observation as a live connection during the freshness grace period.
+		offline := d.Snapshot()
+		offline.Connected = false
+		offline.BackendPID = 0
+		if data, err := json.MarshalIndent(offline, "", "  "); err == nil {
+			_ = store.AtomicWrite(d.paths.SnapshotFile, append(data, '\n'), 0o600)
+		}
 		_ = d.proxy.Close()
 	}()
 
@@ -112,8 +121,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}()
 
+	d.reconcile(ctx)
 	poll := time.NewTicker(d.pollInterval())
 	defer poll.Stop()
+	// The listener and reconciliation loop must remain available while a
+	// dependency-aware autostart waits for health (and for Stop to cancel it).
+	go d.startAutostart(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -212,14 +225,23 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	diagnostics := []model.Diagnostic{}
 	now := time.Now().UTC()
 	unitMissing := false
+	observations := d.observeServices(ctx, config)
 
 	for _, project := range config.Projects {
 		for _, service := range project.Services {
 			runtime := model.ServiceRuntime{ServiceID: service.ID, ProjectID: project.ID, Status: model.StatusStopped}
-			unit, unitErr := d.systemd.Show(ctx, service.ID)
+			observed, observedOK := observations[service.ID]
+			unit, unitErr := observed.unit, observed.unitErr
 			unitKnown := unitErr == nil
-			if unitErr != nil {
+			if !observedOK || unitErr != nil {
 				unitMissing = true
+				if prior, ok := previous.Runtime[service.ID]; ok {
+					runtime = prior
+				}
+				runtime.Stale = true
+				runtime.LastError = "Status refresh unavailable; showing last known state"
+				runtimes[service.ID] = runtime
+				continue
 			} else {
 				runtime.Status = statusFor(unit.ActiveState, unit.SubState)
 			}
@@ -248,20 +270,13 @@ func (d *Daemon) reconcile(ctx context.Context) {
 				runtime.Ports = append([]int{}, prior.Ports...)
 			}
 			if service.Docker != nil {
-				d.mu.RLock()
-				panelOpen := d.panelOpen
-				d.mu.RUnlock()
-				dockerInterval := 30 * time.Second
-				if panelOpen {
-					dockerInterval = 5 * time.Second
-				}
-				if time.Since(d.lastDockerPoll[service.ID]) >= dockerInterval {
-					state, inspectErr := docker.Inspect(ctx, service.Docker.ComposeFile, service.Docker.ProjectName, service.Docker.Service)
+				if observed.dockerPolled {
 					d.lastDockerPoll[service.ID] = time.Now()
-					if inspectErr != nil {
-						runtime.LastError = redact.Text(inspectErr.Error(), secrets)
+					if observed.dockerErr != nil {
+						runtime.LastError = redact.Text(observed.dockerErr.Error(), secrets)
+						runtime.Stale = true
 					} else {
-						d.dockerStates[service.ID] = state
+						d.dockerStates[service.ID] = observed.container
 					}
 				}
 				state := d.dockerStates[service.ID]
@@ -309,13 +324,19 @@ func (d *Daemon) reconcile(ctx context.Context) {
 				}
 			}
 			if service.Health != nil && (runtime.Status == model.StatusRunning || runtime.Status == model.StatusStarting) {
-				hstate := d.healthStates.Get(service.ID)
+				key := runIdentity(service, unit, record)
+				if service.Docker != nil {
+					key = dockerRunIdentity(key, d.dockerStates[service.ID])
+				}
+				hstate, _ := d.healthStates.Observe(service.ID, key)
 				runtime.Health = hstate.Status
 				if hstate.Status == "unhealthy" {
 					runtime.Status = model.StatusUnhealthy
 					runtime.LastError = redact.Text(hstate.LastError, secrets)
 				}
 				d.scheduleHealth(ctx, project.Name, service, record.StartedAt)
+			} else {
+				d.healthStates.Observe(service.ID, "")
 			}
 			d.notifyTransition(config.Settings.Notifications, project.Name, service.Name, d.previousStatus[service.ID], runtime.Status)
 			d.previousStatus[service.ID] = runtime.Status
@@ -323,13 +344,19 @@ func (d *Daemon) reconcile(ctx context.Context) {
 		}
 	}
 	if unitMissing {
-		diagnostics = append(diagnostics, model.Diagnostic{Level: "warning", Code: "systemd-units", Message: "OmaStack user units are not installed or not yet visible to systemd"})
+		diagnostics = append(diagnostics, model.Diagnostic{Level: "warning", Code: "systemd-units", Message: "Some statuses could not refresh: check installed user units, systemd responsiveness and diagnostics"})
 	}
 	if err := d.configureProxy(); err != nil {
 		diagnostics = append(diagnostics, model.Diagnostic{Level: "error", Code: "proxy", Message: err.Error()})
 	}
 	if value := d.proxy.LastError(); value != "" {
 		diagnostics = append(diagnostics, model.Diagnostic{Level: "error", Code: "proxy-runtime", Message: value})
+	}
+	d.mu.RLock()
+	autostartError := d.autostartError
+	d.mu.RUnlock()
+	if autostartError != "" {
+		diagnostics = append(diagnostics, model.Diagnostic{Level: "error", Code: "autostart", Message: autostartError})
 	}
 
 	snapshot := model.Snapshot{
@@ -452,35 +479,42 @@ func systemSignalName(value int) string {
 }
 
 func (d *Daemon) scheduleHealth(ctx context.Context, projectName string, service model.Service, started *time.Time) {
-	check := service.Health
-	if check == nil {
-		return
-	}
-	state := d.healthStates.Get(service.ID)
-	if started != nil && time.Since(*started) < time.Duration(check.StartGraceSeconds)*time.Second {
-		return
-	}
-	if !state.LastChecked.IsZero() && time.Since(state.LastChecked) < time.Duration(check.IntervalSeconds)*time.Second {
+	if service.Health == nil {
 		return
 	}
 	d.mu.Lock()
-	if d.healthRunning[service.ID] {
+	// One outstanding job per service, including identity checks and semaphore
+	// waiting. A new generation cannot accumulate obsolete queued goroutines.
+	if _, ok := d.healthRunning[service.ID]; ok {
 		d.mu.Unlock()
 		return
 	}
-	d.healthRunning[service.ID] = true
+	d.healthRunning[service.ID] = 1
 	d.mu.Unlock()
 	go func() {
-		err := d.healthChecker.Check(ctx, *check)
-		previous := d.healthStates.Get(service.ID)
-		next := health.Transition(previous, err == nil, check.Retries, errorText(err))
-		d.healthStates.Set(service.ID, next)
-		d.mu.Lock()
-		d.healthRunning[service.ID] = false
-		d.mu.Unlock()
-		if previous.Status == "unhealthy" && next.Status == "healthy" {
-			d.notify("normal", "OmaStack service recovered", projectName+" / "+service.Name+" is healthy")
+		defer func() { d.mu.Lock(); delete(d.healthRunning, service.ID); d.mu.Unlock() }()
+		ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		current, key, currentStarted, err := d.currentRun(ctx, service.ID)
+		if err != nil || key == "" || current.Health == nil {
+			return
 		}
+		check := current.Health
+		state, version := d.healthStates.Observe(service.ID, key)
+		if currentStarted != nil && time.Since(*currentStarted) < time.Duration(check.StartGraceSeconds)*time.Second {
+			return
+		}
+		if !state.LastChecked.IsZero() && time.Since(state.LastChecked) < time.Duration(check.IntervalSeconds)*time.Second {
+			return
+		}
+		err = d.healthChecker.Check(ctx, *check)
+		_, after, _, identityErr := d.currentRun(ctx, service.ID)
+		if ctx.Err() == nil && identityErr == nil && after == key {
+			next := health.Transition(state, err == nil, check.Retries, errorText(err))
+			d.healthStates.Commit(service.ID, version, next)
+		}
+		// Notifications are emitted once by the settings-aware reconciliation
+		// transition path, never directly by an asynchronous probe.
 	}()
 }
 
@@ -514,7 +548,7 @@ func (d *Daemon) configureProxy() error {
 func (d *Daemon) resolveProxyPort(serviceID string, configured int) (int, bool) {
 	snapshot := d.Snapshot()
 	runtime, ok := snapshot.Runtime[serviceID]
-	if !ok || (runtime.Status != model.StatusRunning && runtime.Status != model.StatusUnhealthy) {
+	if !ok || runtime.Stale || (runtime.Status != model.StatusRunning && runtime.Status != model.StatusUnhealthy) {
 		return 0, false
 	}
 	if configured > 0 {
@@ -527,14 +561,43 @@ func (d *Daemon) resolveProxyPort(serviceID string, configured int) (int, bool) 
 }
 
 func (d *Daemon) startAutostart(ctx context.Context) {
+	// RuntimeDir is scoped to the user-manager session. Updating/restarting
+	// only the daemon must not revive apps the user deliberately stopped.
+	marker := filepath.Join(d.paths.RuntimeDir, "autostart-attempted")
+	if _, err := os.Lstat(marker); err == nil {
+		return
+	} else if !os.IsNotExist(err) {
+		d.setAutostartError(err)
+		return
+	}
+	if err := store.AtomicWrite(marker, []byte("1\n"), 0o600); err != nil {
+		d.setAutostartError(err)
+		return
+	}
+	operationCtx, finish, err := d.beginSerializedOperation(ctx, "start")
+	if err != nil {
+		d.setAutostartError(err)
+		return
+	}
+	defer finish()
 	config := d.store.Get()
+	var targets []string
 	for _, project := range config.Projects {
 		for _, service := range project.Services {
 			if service.Autostart {
-				_ = d.systemd.Start(ctx, service.ID)
+				targets = append(targets, service.ID)
 			}
 		}
 	}
+	if len(targets) > 0 {
+		d.setAutostartError(d.startServices(operationCtx, config.AllServices(), targets))
+	}
+}
+
+func (d *Daemon) setAutostartError(err error) {
+	d.mu.Lock()
+	d.autostartError = redact.Text(errorText(err), redact.Secrets(d.store.Get()))
+	d.mu.Unlock()
 }
 
 func errorText(err error) string {

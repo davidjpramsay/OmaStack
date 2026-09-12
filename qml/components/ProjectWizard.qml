@@ -4,29 +4,42 @@ import QtQuick.Layouts as Layouts
 import qs.Commons
 import qs.Ui
 
-Item {
+FocusScope {
   id: root
   property bool opened: false
   property int page: 0
+  property bool saving: false
+  property string saveError: ""
   signal canceled()
   signal completed(var project)
 
   function reset() {
+    saving = false; saveError = ""
     page = 0
     projectName.text = ""
     projectDescription.text = ""
     projectIcon.text = "󰆍"
     serviceName.text = ""
     executable.text = ""
-    arguments.text = ""
+    argumentsField.text = ""
     workingDirectory.text = ""
     autostart.checked = false
     shellMode.checked = false
     shellCommand.text = ""
   }
 
+  function cancelEditor() {
+    if (saving) return
+    if (projectName.text !== "" || serviceName.text !== "" || executable.text !== "" || workingDirectory.text !== "" || shellCommand.text !== "") discardDialog.opened = true
+    else canceled()
+  }
+  Keys.onEscapePressed: function(event) { if (discardDialog.opened) discardDialog.opened = false; else cancelEditor(); event.accepted = true }
+  Keys.onPressed: function(event) { if (discardDialog.opened && discardDialog.handleKey(event)) event.accepted = true }
+  onOpenedChanged: if (opened) Qt.callLater(function() { projectName.forceActiveFocus() })
+
   function finish() {
-    var args = String(arguments.text || "").split("\n").filter(function(value) { return value.length > 0 })
+    if (saving) return
+    var args = argumentsField.text === "" ? [] : argumentsField.text.split("\n")
     var service = {
       name: serviceName.text.trim(),
       description: "",
@@ -92,7 +105,7 @@ Item {
               font.pixelSize: Style.font.bodySmall
             }
           }
-          Button { id: closeButton; iconText: "󰅖"; tooltipText: "Cancel"; focusable: true; onClicked: root.canceled() }
+          Button { id: closeButton; iconText: "󰅖"; tooltipText: "Cancel"; focusable: true; enabled: !root.saving; onClicked: root.cancelEditor() }
         }
 
         Row {
@@ -112,8 +125,9 @@ Item {
 
         Layouts.StackLayout {
           id: pages
+          enabled: !root.saving
           width: parent.width
-          height: parent.height - navigation.height - Style.space(92)
+          height: Math.max(0, parent.height - navigation.height - wizardError.height - Style.space(108))
           currentIndex: root.page
 
           Controls.ScrollView {
@@ -151,7 +165,7 @@ Item {
                 spacing: Style.space(5)
                 Text { textFormat: Text.PlainText; text: "ARGUMENTS · ONE PER LINE"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption; font.bold: true }
                 Controls.TextArea {
-                  id: arguments
+                  id: argumentsField
                   width: parent.width
                   height: Style.space(120)
                   color: Color.foreground
@@ -161,8 +175,8 @@ Item {
                   wrapMode: TextEdit.NoWrap
                   Accessible.name: "Command arguments, one per line"
                   background: BorderSurface {
-                    color: Style.controlFill(arguments.activeFocus, arguments.hovered, Color.foreground, Color.accent)
-                    borderSpec: Border.controlSpec(arguments.activeFocus ? "focus" : "normal", Color.foreground, Color.accent)
+                    color: Style.controlFill(argumentsField.activeFocus, argumentsField.hovered, Color.foreground, Color.accent)
+                    borderSpec: Border.controlSpec(argumentsField.activeFocus ? "focus" : "normal", Color.foreground, Color.accent)
                     radius: Style.cornerRadius
                   }
                 }
@@ -180,7 +194,7 @@ Item {
                 id: autostart
                 width: parent.width
                 label: "Start with OmaStack"
-                description: "The user daemon starts this service after login and reconciles it after shell reloads."
+                description: "Starts once per user-manager session. Daemon updates preserve stopped services."
                 onClicked: checked = !checked
               }
               Toggle {
@@ -230,7 +244,7 @@ Item {
               PanelSectionHeader { text: "FIRST SERVICE" }
               Text { textFormat: Text.PlainText; text: serviceName.text || "Unnamed service"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.title; font.bold: true }
               Text { textFormat: Text.PlainText;
-                text: shellMode.checked ? shellCommand.text : ([executable.text].concat(String(arguments.text || "").split("\n")).join(" "))
+                text: shellMode.checked ? shellCommand.text : ([executable.text].concat(String(argumentsField.text || "").split("\n")).join(" "))
                 color: Color.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
@@ -242,8 +256,11 @@ Item {
           }
         }
 
+        Text { textFormat: Text.PlainText; id: wizardError; width: parent.width; text: root.saving ? "Saving…" : root.saveError; color: Color.urgent; wrapMode: Text.WordWrap; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+
         Row {
           id: navigation
+          enabled: !root.saving
           width: parent.width
           spacing: Style.space(8)
           Button { visible: root.page > 0; text: "Back"; iconText: "󰁍"; focusable: true; onClicked: root.page-- }
@@ -269,4 +286,5 @@ Item {
       }
     }
   }
+  ConfirmDialog { id: discardDialog; anchors.fill: parent; message: "Discard this unsaved project?"; confirmText: "Discard"; onOpenedChanged: if (opened) root.forceActiveFocus(); onCanceled: opened = false; onConfirmed: { opened = false; root.canceled() } }
 }

@@ -59,8 +59,8 @@ func TestClientTimeoutsAndDurations(t *testing.T) {
 		t.Fatalf("client = %#v", got)
 	}
 	for method, want := range map[string]time.Duration{
-		"status": 30 * time.Second, "start": 6 * time.Minute, "restart": 6 * time.Minute,
-		"docker.action": 6 * time.Minute, "stop": 2 * time.Minute, "kill": 2 * time.Minute, "config.import": 2 * time.Minute,
+		"status": 30 * time.Second, "start": 6 * time.Minute, "restart": 12*time.Hour + 10*time.Second,
+		"docker.action": 6 * time.Minute, "stop": 12*time.Hour + 10*time.Second, "kill": 2 * time.Minute, "config.import": 2 * time.Minute,
 	} {
 		if got := clientForMethod(resolved, method).Timeout; got != want {
 			t.Errorf("%s timeout = %v, want %v", method, got, want)

@@ -57,6 +57,8 @@ type configImportPayload struct {
 }
 
 func (d *Daemon) handle(ctx context.Context, request control.Request) control.Response {
+	ctx, cancel := context.WithTimeout(ctx, methodTimeout(request.Method))
+	defer cancel()
 	if serializedOperation(request.Method) {
 		operationCtx, finish, err := d.beginSerializedOperation(ctx, request.Method)
 		if err != nil {
@@ -98,6 +100,8 @@ func (d *Daemon) handle(ctx context.Context, request control.Request) control.Re
 			err = d.store.Update(func(config *model.Config) error { config.Settings = params.Settings; return nil })
 		}
 		result = map[string]string{"status": "saved"}
+	case "settings.patch":
+		result, err = d.patchSettings(request.Params)
 	case "ui.visibility":
 		var params visibilityPayload
 		err = decodeParams(request.Params, &params)
@@ -173,6 +177,9 @@ func (d *Daemon) beginSerializedOperation(ctx context.Context, method string) (c
 }
 
 func methodTimeout(method string) time.Duration {
+	if method == "stop" || method == "restart" {
+		return 12 * time.Hour
+	}
 	if method == "start" || method == "restart" || method == "docker.action" {
 		return 6 * time.Minute
 	}
@@ -195,7 +202,7 @@ func interruptsOperation(method string) bool {
 func serializedOperation(method string) bool {
 	switch method {
 	case "start", "stop", "restart", "kill",
-		"config.import", "settings.update",
+		"config.import", "settings.update", "settings.patch",
 		"project.create", "project.update", "project.duplicate", "project.delete", "project.reorder",
 		"service.create", "service.update", "service.delete",
 		"docker.import", "docker.action", "docker.terminal", "cleanup":
@@ -226,34 +233,25 @@ func (d *Daemon) performAction(ctx context.Context, action, target string) error
 	services := config.AllServices()
 	switch action {
 	case "start":
-		order, err := deps.StartupOrder(services, ids)
-		if err != nil {
-			return err
-		}
-		for _, id := range order {
-			service := services[id]
-			for _, dependency := range service.Dependencies {
-				if dependency.Condition == "healthy" {
-					if err := d.waitHealthy(ctx, dependency.ServiceID, 5*time.Minute); err != nil {
-						return fmt.Errorf("dependency %s: %w", dependency.ServiceID, err)
-					}
-				}
-			}
-			_ = d.systemd.ResetFailed(ctx, id)
-			if err := d.systemd.Start(ctx, id); err != nil {
-				return err
-			}
-		}
+		return d.startServices(ctx, services, ids)
 	case "stop":
 		order, err := deps.ShutdownOrder(services, ids)
 		if err != nil {
 			return err
 		}
+		var failures []error
 		for _, id := range order {
-			if err := d.systemd.Stop(ctx, id); err != nil {
-				return err
+			if ctx.Err() != nil {
+				return errors.Join(append(failures, ctx.Err())...)
+			}
+			d.healthStates.Reset(id)
+			manager := d.systemd
+			manager.Timeout = time.Duration(services[id].GracefulStopSeconds+10) * time.Second
+			if err := manager.Stop(ctx, id); err != nil {
+				failures = append(failures, err)
 			}
 		}
+		return errors.Join(failures...)
 	case "restart":
 		if err := d.performAction(ctx, "stop", target); err != nil {
 			return err
@@ -261,6 +259,7 @@ func (d *Daemon) performAction(ctx context.Context, action, target string) error
 		return d.performAction(ctx, "start", target)
 	case "kill":
 		for _, id := range ids {
+			d.healthStates.Reset(id)
 			if err := d.systemd.ForceKill(ctx, id); err != nil {
 				return err
 			}
@@ -316,30 +315,15 @@ func resolveTargets(config model.Config, target string) ([]string, error) {
 	return matches, nil
 }
 
-func (d *Daemon) waitHealthy(ctx context.Context, id string, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		state := d.healthStates.Get(id)
-		if state.Status == "healthy" {
-			return nil
-		}
-		if state.Status == "unhealthy" {
-			return errors.New(state.LastError)
-		}
+func (d *Daemon) readLogs(ctx context.Context, params control.LogsParams) (any, error) {
+	if d.logWorkers != nil {
 		select {
+		case d.logWorkers <- struct{}{}:
+			defer func() { <-d.logWorkers }()
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return errors.New("timed out waiting for healthy service")
-		case <-ticker.C:
+			return nil, ctx.Err()
 		}
 	}
-}
-
-func (d *Daemon) readLogs(ctx context.Context, params control.LogsParams) (any, error) {
 	config := d.store.Get()
 	ids, err := resolveTargets(config, params.Target)
 	if err != nil {
@@ -349,8 +333,8 @@ func (d *Daemon) readLogs(ctx context.Context, params control.LogsParams) (any, 
 	if lines < 1 {
 		lines = 200
 	}
-	if lines > 5000 {
-		lines = 5000
+	if lines > 50000 {
+		lines = 50000
 	}
 	names := map[string]string{}
 	for _, project := range config.Projects {
@@ -359,19 +343,25 @@ func (d *Daemon) readLogs(ctx context.Context, params control.LogsParams) (any, 
 		}
 	}
 	entries := make([]logs.Entry, 0, lines)
-	perService := lines
-	if len(ids) > 1 {
-		perService = lines/len(ids) + 1
-	}
+	truncated := false
 	for _, id := range ids {
-		serviceEntries, readErr := logs.Read(ctx, id, perService, params.Query)
+		serviceEntries, limited, readErr := logs.ReadDetailed(ctx, id, lines, params.Query)
 		if readErr != nil {
 			return nil, readErr
 		}
 		for index := range serviceEntries {
 			serviceEntries[index].Service = names[id]
 		}
+		truncated = truncated || limited
 		entries = append(entries, serviceEntries...)
+		// Bound the merge after every source, not only after all 128 sources.
+		sort.SliceStable(entries, func(i, j int) bool { return entries[i].Timestamp.Before(entries[j].Timestamp) })
+		if len(entries) > lines {
+			entries = entries[len(entries)-lines:]
+		}
+		bounded := boundLogEntries(entries, control.MaxMessageBytes/2)
+		truncated = truncated || len(bounded) < len(entries)
+		entries = bounded
 	}
 	sort.SliceStable(entries, func(left, right int) bool { return entries[left].Timestamp.Before(entries[right].Timestamp) })
 	if len(entries) > lines {
@@ -381,30 +371,31 @@ func (d *Daemon) readLogs(ctx context.Context, params control.LogsParams) (any, 
 	for i := range entries {
 		entries[i].Message = redact.Text(entries[i].Message, secrets)
 	}
-	return boundLogEntries(entries, control.MaxMessageBytes/2), nil
+	bounded := boundLogEntries(entries, control.MaxMessageBytes/2)
+	truncated = truncated || len(bounded) < len(entries)
+	if params.Metadata {
+		result := logs.Result{Entries: bounded, Truncated: truncated, Limit: lines}
+		if truncated {
+			result.Notice = "Showing newest available entries; journal capture, message, or 512 KiB response limit reached."
+		}
+		return result, nil
+	}
+	return bounded, nil
 }
 
 func boundLogEntries(entries []logs.Entry, budget int) []logs.Entry {
 	if budget < 1024 {
 		return nil
 	}
-	remaining := budget
+	remaining := budget - 2 // JSON array delimiters.
 	reversed := make([]logs.Entry, 0, len(entries))
 	for index := len(entries) - 1; index >= 0; index-- {
 		entry := entries[index]
-		// Reserve JSON field/timestamp overhead as well as the visible strings.
-		fixed := 256 + len(entry.ServiceID) + len(entry.Service) + len(entry.Stream)
-		if fixed >= remaining {
+		encoded, err := json.Marshal(entry)
+		if err != nil || len(encoded)+1 > remaining {
 			break
 		}
-		allowedMessage := remaining - fixed
-		if len(entry.Message) > allowedMessage {
-			if allowedMessage <= 3 {
-				break
-			}
-			entry.Message = entry.Message[:allowedMessage-3] + "…"
-		}
-		remaining -= fixed + len(entry.Message)
+		remaining -= len(encoded) + 1
 		reversed = append(reversed, entry)
 	}
 	result := make([]logs.Entry, len(reversed))
@@ -464,6 +455,7 @@ func (d *Daemon) duplicateProject(raw json.RawMessage) (any, error) {
 		return nil, err
 	}
 	var duplicate model.Project
+	clearedRoutes := false
 	err := d.store.Update(func(config *model.Config) error {
 		for _, project := range config.Projects {
 			if project.ID != params.ProjectID {
@@ -472,10 +464,20 @@ func (d *Daemon) duplicateProject(raw json.RawMessage) (any, error) {
 			data, _ := json.Marshal(project)
 			_ = json.Unmarshal(data, &duplicate)
 			duplicate.ID, _ = validate.NewID()
-			duplicate.Name += " copy"
+			name := []rune(duplicate.Name)
+			if len(name) > 75 {
+				name = name[:75]
+			}
+			duplicate.Name = string(name) + " copy"
 			duplicate.Order = len(config.Projects)
 			remap := map[string]string{}
 			for index := range duplicate.Services {
+				// A cloned definition must not steal the original's unique route.
+				// Let the user explicitly assign hostnames for the copied stack.
+				if duplicate.Services[index].Route != nil {
+					clearedRoutes = true
+					duplicate.Services[index].Route = nil
+				}
 				old := duplicate.Services[index].ID
 				duplicate.Services[index].ID, _ = validate.NewID()
 				remap[old] = duplicate.Services[index].ID
@@ -492,7 +494,11 @@ func (d *Daemon) duplicateProject(raw json.RawMessage) (any, error) {
 		}
 		return errors.New("project not found")
 	})
-	return map[string]string{"status": "created", "id": duplicate.ID}, err
+	result := map[string]string{"status": "created", "id": duplicate.ID}
+	if clearedRoutes {
+		result["notice"] = "Project duplicated without local routes; assign unique hostnames to the copy."
+	}
+	return result, err
 }
 
 func (d *Daemon) deleteProject(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -775,6 +781,7 @@ func (d *Daemon) dockerAction(ctx context.Context, raw json.RawMessage) (any, er
 	if !ok || service.Docker == nil {
 		return nil, errors.New("docker service not found")
 	}
+	d.healthStates.Reset(service.ID)
 	err := docker.Action(ctx, service.Docker.ComposeFile, service.Docker.ProjectName, service.Docker.Service, params.Action)
 	return map[string]string{"status": "ok"}, err
 }

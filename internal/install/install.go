@@ -75,8 +75,26 @@ func Setup(ctx context.Context, resolved paths.Paths) (Result, error) {
 	if _, err := systemctl(ctx, "daemon-reload"); err != nil {
 		return Result{}, err
 	}
-	if _, err := systemctl(ctx, "enable", "--now", "omastackd.service"); err != nil {
+	_, activeErr := systemctl(ctx, "is-active", "--quiet", "omastackd.service")
+	if activeErr == nil {
+		// Older daemons do not have the session autostart marker yet. Preserve
+		// the current app selection when upgrading them too.
+		if err := store.AtomicWrite(filepath.Join(resolved.RuntimeDir, "autostart-attempted"), []byte("1\n"), 0o600); err != nil {
+			return Result{}, err
+		}
+	}
+	if _, err := systemctl(ctx, "enable", "omastackd.service"); err != nil {
 		return Result{}, err
+	}
+	action := "start"
+	if activeErr == nil {
+		action = "restart"
+	}
+	if _, err := systemctl(ctx, action, "omastackd.service"); err != nil {
+		return Result{}, err
+	}
+	if _, err := systemctl(ctx, "is-active", "--quiet", "omastackd.service"); err != nil {
+		return Result{}, fmt.Errorf("new daemon did not become active: %w", err)
 	}
 	return Result{Binary: target, DaemonUnit: daemonPath, ServiceUnit: servicePath}, nil
 }
@@ -97,7 +115,7 @@ func Uninstall(ctx context.Context, resolved paths.Paths, serviceIDs []string, r
 	}
 	// Stop the control plane before service shutdown so no OmaStack client can
 	// race the uninstall by starting a unit after it has been stopped.
-	manager := systemd.Manager{Timeout: 30 * time.Second}
+	manager := systemd.Manager{Timeout: 310 * time.Second}
 	for _, id := range serviceIDs {
 		if err := manager.Stop(ctx, id); err != nil {
 			return fmt.Errorf("stop managed service %s: %w", id, err)

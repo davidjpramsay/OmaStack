@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls as Controls
 import QtQuick.Layouts as Layouts
 import Quickshell.Io
@@ -23,6 +24,8 @@ Item {
   property int keyboardProjectIndex: 0
   property bool keyboardCursorActive: false
   property bool advancedSettingsExpanded: false
+  property var pendingEditor: null
+  property string pendingSaveToken: ""
 
   signal closeRequested()
   signal switchRequested(int direction)
@@ -34,14 +37,17 @@ Item {
   readonly property var selectedProject: projectById(selectedProjectId)
   readonly property var selectedService: serviceById(selectedServiceId)
   readonly property bool connected: Boolean(service && service.connected)
+  readonly property int visibleProjectCount: projectList.count
+  readonly property var settings: service && service.settings ? service.settings : (service && service.snapshot.settings ? service.snapshot.settings : ({}))
   readonly property color primaryText: Color.popups.text
   readonly property color secondaryText: Qt.tint(Color.popups.background, Util.alpha(primaryText, 0.82))
   readonly property bool editorOpen: projectWizard.opened || projectEditor.opened || serviceEditor.opened || deleteDialog.opened || importDialog.opened
   readonly property int stackListHeight: estimatedStackListHeight()
   readonly property int preferredWidth: 380
+  readonly property real stackChromeHeight: stackHero.implicitHeight + counts.height + searchField.implicitHeight + stackSeparatorTop.height + stackSeparatorBottom.height + stackFooter.height + stackColumn.spacing*6
   readonly property real preferredHeight: editorOpen
     ? Style.space(620)
-    : (section === "stack" ? stackColumn.implicitHeight
+    : (section === "stack" ? stackChromeHeight + Style.space(stackListHeight)
       : (section === "settings" ? settingsPage.implicitHeight : Style.space(590)))
   implicitHeight: preferredHeight
 
@@ -119,8 +125,12 @@ Item {
       total += 38
       if (project.id === expandedProjectId) {
         var visibleServices = filteredServices(project)
-        total += visibleServices.length * 37
-        if (selectedServiceId !== "" && visibleServices.some(function(item) { return item.id === selectedServiceId })) total += 48
+        for (var si=0; si<visibleServices.length; si++) {
+          var svc = visibleServices[si]
+          var value = runtime[svc.id] || {}
+          total += (selectedServiceId === svc.id ? 82 : 34) + 3
+          if ((value.status === "crashed" || value.status === "unhealthy") && value.lastError) total += 18
+        }
         if (visibleServices.length === 0) total += 38
       }
       if (index > 0) total += 4
@@ -230,17 +240,48 @@ Item {
     openUrlProcess.running = true
   }
 
+  function routeUrl(route) {
+    if (route.url) return route.url
+    return (route.https ? "https://" : "http://") + route.hostname + ":" + (route.https ? (settings.proxy || {}).httpsPort : (settings.proxy || {}).httpPort)
+  }
+
+  function serviceRouteUrl(serviceData) {
+    if (!serviceData.route || !service || !service.snapshot.routes) return ""
+    var host = String(serviceData.route.hostname).trim().toLowerCase().replace(/\.$/, "")
+    for (var i=0; i<service.snapshot.routes.length; i++) {
+      var route = service.snapshot.routes[i]
+      if (route.active && route.hostname === host) return routeUrl(route)
+    }
+    return ""
+  }
+
+  function focusWithin(item) {
+    var focus = root.Window.window ? root.Window.window.activeFocusItem : null
+    while (focus) { if (focus === item) return true; focus = focus.parent }
+    return false
+  }
+
+  function saveEditor(editor, token) {
+    if (!token) { editor.saveError = service.lastError || "Could not queue save"; return }
+    editor.saving = true
+    editor.saveError = ""
+    pendingEditor = editor
+    pendingSaveToken = String(token)
+  }
+
   function mutateSettings(sectionName, key, value) {
     if (!service || !service.snapshot || !service.snapshot.settings) return
-    var settings = JSON.parse(JSON.stringify(service.snapshot.settings))
-    if (sectionName === "") settings[key] = value
-    else settings[sectionName][key] = value
-    service.updateSettings(settings)
+    var patch = {}
+    if (sectionName === "") patch[key] = value
+    else { patch[sectionName] = {}; patch[sectionName][key] = value }
+    service.updateSettings(patch)
   }
 
   function requestDelete(type, id) {
     pendingDeleteType = type; pendingDeleteId = id
-    deleteDialog.message = type === "project"
+    deleteDialog.confirmText = type === "kill" ? "Force kill" : "Delete"
+    deleteDialog.message = type === "kill" ? "Force-kill this service and its child processes? Unsaved application data may be lost."
+      : type === "project"
       ? "Delete this project and its service definitions? Running services must be stopped first."
       : "Delete this service definition? This is refused while another service depends on it."
     deleteDialog.opened = true
@@ -259,22 +300,23 @@ Item {
 
   onProjectsChanged: ensureSelection()
 
-  PanelKeyCatcher {
+  Item {
     id: keyCatcher
     anchors.fill: parent
-    blocked: searchField.activeFocus || root.editorOpen
-    onCloseRequested: root.requestBackOrClose()
-    onTabRequested: function(direction) { root.switchRequested(direction) }
-    onMoveRequested: function(dx, dy) {
-      if (root.section === "stack" && dy !== 0) root.moveProjectCursor(dy)
-    }
-    onActivateRequested: {
-      if (root.section === "stack") root.activateProjectCursor()
-    }
-    onTextKey: function(text) {
-      if (text === "/") searchField.forceActiveFocus()
-      else if (text === "a" || text === "A") { projectWizard.reset(); projectWizard.opened = true }
-      else if (text === "r" || text === "R") { if (root.service) root.service.refresh() }
+    focus: true
+    Keys.onPressed: function(event) {
+      if (deleteDialog.opened && deleteDialog.handleKey(event)) { event.accepted = true; return }
+      if (importDialog.opened && importDialog.handleKey(event)) { event.accepted = true; return }
+      if (root.editorOpen) return
+      if (event.key === Qt.Key_Escape) { root.requestBackOrClose(); event.accepted = true; return }
+      // Leave Tab/Backtab and focused controls' keys to Qt's real focus chain.
+      if (!activeFocus || event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) return
+      if (event.key === Qt.Key_Down) { root.moveProjectCursor(1); event.accepted = true }
+      else if (event.key === Qt.Key_Up) { root.moveProjectCursor(-1); event.accepted = true }
+      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Space) { root.activateProjectCursor(); event.accepted = true }
+      else if (event.text === "/") { searchField.forceActiveFocus(); event.accepted = true }
+      else if (event.text === "a" || event.text === "A") { projectWizard.reset(); projectWizard.opened = true; event.accepted = true }
+      else if (event.text === "r" || event.text === "R") { if (root.service) root.service.refresh(); event.accepted = true }
     }
 
     Layouts.StackLayout {
@@ -288,6 +330,7 @@ Item {
           spacing: Style.space(10)
 
           PanelHero {
+            id: stackHero
             width: parent.width
             title: "OmaStack"
             meta: root.connected ? "Service manager" : "Backend disconnected"
@@ -345,17 +388,18 @@ Item {
             }
           }
 
-          PanelSeparator { width: parent.width }
+          PanelSeparator { id: stackSeparatorTop; width: parent.width }
 
           ListView {
             id: projectList
             width: parent.width
-            height: Style.space(root.stackListHeight)
+            height: Math.max(0, Math.min(Style.space(root.stackListHeight), root.height-root.stackChromeHeight))
             model: root.filteredProjects()
             spacing: Style.space(4)
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             interactive: contentHeight > height
+            Controls.ScrollBar.vertical: Controls.ScrollBar {}
 
             delegate: Item {
               id: projectDelegate
@@ -432,17 +476,17 @@ Item {
 
                     Row {
                       id: projectActions
-                      visible: projectHover.hovered || projectHeader.activeFocus
+                      visible: projectHover.hovered || root.focusWithin(projectHeader)
                       anchors.right: chevron.left
                       anchors.rightMargin: Style.space(4)
                       anchors.verticalCenter: parent.verticalCenter
                       spacing: Style.space(1)
-                      PanelActionButton { iconText: projectDelegate.runningState ? "󰓛" : "󰐊"; tooltipText: projectDelegate.runningState ? "Stop project" : "Start project"; onClicked: projectDelegate.runningState ? root.service.stop(projectDelegate.modelData.id) : root.service.start(projectDelegate.modelData.id) }
-                      PanelActionButton { iconText: "󰆍"; tooltipText: "Project logs"; onClicked: root.showLogs(projectDelegate.modelData.id, projectDelegate.modelData.id) }
-                      PanelActionButton { iconText: "󰆏"; tooltipText: "Duplicate project"; onClicked: root.service.duplicateProject(projectDelegate.modelData.id) }
-                      PanelActionButton { iconText: "󰏫"; tooltipText: "Edit project"; onClicked: projectEditor.begin(projectDelegate.modelData) }
-                      PanelActionButton { iconText: "󰐕"; tooltipText: "Add service"; onClicked: { root.selectedProjectId = projectDelegate.modelData.id; serviceEditor.begin(projectDelegate.modelData.id, null) } }
-                      PanelActionButton { iconText: "󰆴"; tooltipText: "Delete project"; hoverColor: Color.urgent; onClicked: root.requestDelete("project", projectDelegate.modelData.id) }
+                      PanelActionButton { iconText: projectDelegate.runningState || projectDelegate.status === "starting" ? "󰓛" : "󰐊"; tooltipText: projectDelegate.runningState || projectDelegate.status === "starting" ? "Stop project" : "Start project"; focusable: true; onClicked: projectDelegate.runningState || projectDelegate.status === "starting" ? root.service.stop(projectDelegate.modelData.id) : root.service.start(projectDelegate.modelData.id) }
+                      PanelActionButton { iconText: "󰆍"; tooltipText: "Project logs"; focusable: true; onClicked: root.showLogs(projectDelegate.modelData.id, projectDelegate.modelData.id) }
+                      PanelActionButton { iconText: "󰆏"; tooltipText: "Duplicate project"; focusable: true; onClicked: root.service.duplicateProject(projectDelegate.modelData.id) }
+                      PanelActionButton { iconText: "󰏫"; tooltipText: "Edit project"; focusable: true; onClicked: projectEditor.begin(projectDelegate.modelData) }
+                      PanelActionButton { iconText: "󰐕"; tooltipText: "Add service"; focusable: true; onClicked: { root.selectedProjectId = projectDelegate.modelData.id; serviceEditor.begin(projectDelegate.modelData.id, null) } }
+                      PanelActionButton { iconText: "󰆴"; tooltipText: "Delete project"; hoverColor: Color.urgent; focusable: true; onClicked: root.requestDelete("project", projectDelegate.modelData.id) }
                     }
 
                     Text { textFormat: Text.PlainText; id: chevron; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: projectDelegate.expanded ? "󰅀" : "󰅂"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
@@ -478,6 +522,8 @@ Item {
                         runtimeData: root.runtime[modelData.id] || ({ status: "stopped", cpu: 0, memoryMb: 0, ports: [], history: [] })
                         expanded: root.selectedServiceId === modelData.id
                         panelVisible: root.panelVisible
+                        historySamples: Number(root.settings.historySamples || 60)
+                        routeUrl: root.serviceRouteUrl(modelData)
                         primaryText: root.primaryText
                         secondaryText: root.secondaryText
                         onClicked: {
@@ -491,6 +537,7 @@ Item {
                         onLogsRequested: function(id) { root.showLogs(id, projectDelegate.modelData.id) }
                         onEditRequested: function(id) { serviceEditor.begin(projectDelegate.modelData.id, root.serviceById(id)) }
                         onDeleteRequested: function(id) { root.requestDelete("service", id) }
+                        onForceKillRequested: function(id) { root.requestDelete("kill", id) }
                         onOpenRequested: function(url) { root.openBrowserUrl(url) }
                         onDockerActionRequested: function(id, action) { root.service.dockerAction(id, action) }
                         onDockerTerminalRequested: function(id) { root.service.dockerTerminal(id) }
@@ -515,14 +562,15 @@ Item {
               visible: projectList.count === 0
               spacing: Style.space(7)
               Text { textFormat: Text.PlainText; anchors.horizontalCenter: parent.horizontalCenter; text: root.projects.length === 0 ? "󰆍" : "󰍉"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.display }
-              Text { textFormat: Text.PlainText; anchors.horizontalCenter: parent.horizontalCenter; text: root.projects.length === 0 ? "No projects yet" : "No matching projects"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
-              Button { visible: root.projects.length === 0; anchors.horizontalCenter: parent.horizontalCenter; text: "Add project"; iconText: "󰐕"; focusable: true; onClicked: { projectWizard.reset(); projectWizard.opened = true } }
+              Text { textFormat: Text.PlainText; anchors.horizontalCenter: parent.horizontalCenter; text: !root.connected ? "Waiting for the backend. Your saved projects are preserved." : (root.projects.length === 0 ? "No projects yet" : "No matching projects"); width: projectList.width - Style.space(24); horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+              Button { visible: root.projects.length === 0 && root.connected; anchors.horizontalCenter: parent.horizontalCenter; text: "Add project"; iconText: "󰐕"; focusable: true; onClicked: { projectWizard.reset(); projectWizard.opened = true } }
             }
           }
 
-          PanelSeparator { width: parent.width }
+          PanelSeparator { id: stackSeparatorBottom; width: parent.width }
 
           Row {
+            id: stackFooter
             width: parent.width
             height: Style.space(28)
             spacing: Style.space(4)
@@ -553,18 +601,19 @@ Item {
           PanelSeparator { width: parent.width }
           ListView {
             id: routeList
-            width: parent.width; height: Style.space(450); clip: true
+            width: parent.width; height: Math.max(0, parent.height-y); clip: true
+            Controls.ScrollBar.vertical: Controls.ScrollBar {}
             model: root.service && root.service.snapshot.routes ? root.service.snapshot.routes : []
             spacing: Style.space(4)
             delegate: Button {
               required property var modelData
               width: routeList.width; height: Style.space(48); leftAlign: true; focusable: true
-              onClicked: if (modelData.active) root.openBrowserUrl((modelData.https ? "https://" : "http://") + modelData.hostname)
+              onClicked: if (modelData.active) root.openBrowserUrl(root.routeUrl(modelData))
               Item {
                 anchors.fill: parent; anchors.margins: Style.space(8)
                 StatusDot { id: routeDot; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; status: modelData.active ? "running" : "crashed" }
                 Column { anchors.left: routeDot.right; anchors.leftMargin: Style.space(8); anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-                  Text { textFormat: Text.PlainText; width: parent.width; text: (modelData.https ? "https://" : "http://") + modelData.hostname; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true; elide: Text.ElideRight }
+                  Text { textFormat: Text.PlainText; width: parent.width; text: root.routeUrl(modelData); color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true; elide: Text.ElideRight }
                   Text { textFormat: Text.PlainText; width: parent.width; text: modelData.active ? modelData.target : (modelData.error || "Inactive"); color: modelData.active ? root.secondaryText : Color.urgent; font.family: Style.font.family; font.pixelSize: Style.font.caption; elide: Text.ElideRight }
                 }
               }
@@ -576,7 +625,7 @@ Item {
 
       Item {
         id: settingsPage
-        implicitHeight: settingsPageColumn.implicitHeight
+        implicitHeight: Style.space(49) + Math.min(Style.space(525), settingsColumn.implicitHeight)
 
         Column {
           id: settingsPageColumn
@@ -589,10 +638,12 @@ Item {
           }
           PanelSeparator { width: parent.width }
           Controls.ScrollView {
-            width: parent.width; height: Math.min(Style.space(525), settingsColumn.implicitHeight); clip: true; contentWidth: availableWidth
+            id: settingsScroll
+            width: parent.width; height: Math.max(0, Math.min(parent.height-y, settingsColumn.implicitHeight)); clip: true; contentWidth: availableWidth
             Column {
               id: settingsColumn
-              width: parent.width; spacing: Style.space(10)
+              width: settingsScroll.availableWidth; spacing: Style.space(10)
+              Text { textFormat: Text.PlainText; visible: Boolean(root.service && root.service.settingsPending); text: "Saving settings…"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.caption }
               PanelSectionHeader { text: "APPEARANCE" }
               CompactToggleRow {
                 width: parent.width
@@ -605,15 +656,15 @@ Item {
               Row {
                 width: parent.width
                 spacing: Style.space(6)
-                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Poll (s)"; from: 1; to: 60; value: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.pollIntervalSeconds : 2; onModified: function(value) { root.mutateSettings("", "pollIntervalSeconds", value) } }
-                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Samples"; from: 10; to: 600; value: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.historySamples : 60; onModified: function(value) { root.mutateSettings("", "historySamples", value) } }
-                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Log lines"; from: 100; to: 50000; stepSize: 100; value: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.logBufferLines : 2000; onModified: function(value) { root.mutateSettings("", "logBufferLines", value) } }
+                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Poll (s)"; from: 1; to: 60; value: root.settings && Object.keys(root.settings).length ? root.settings.pollIntervalSeconds : 2; onModified: function(value) { root.mutateSettings("", "pollIntervalSeconds", value) } }
+                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Samples"; from: 10; to: 600; value: root.settings && Object.keys(root.settings).length ? root.settings.historySamples : 60; onModified: function(value) { root.mutateSettings("", "historySamples", value) } }
+                NumberField { width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Log lines"; from: 100; to: 50000; stepSize: 100; value: root.settings && Object.keys(root.settings).length ? root.settings.logBufferLines : 2000; onModified: function(value) { root.mutateSettings("", "logBufferLines", value) } }
               }
               PanelSeparator { width: parent.width }
               PanelSectionHeader { text: "NOTIFICATIONS" }
-              CompactToggleRow { width: parent.width; label: "Unhealthy"; checked: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.notifications.unhealthy : true; onToggled: root.mutateSettings("notifications", "unhealthy", !checked) }
-              CompactToggleRow { width: parent.width; label: "Crashed"; checked: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.notifications.crashed : true; onToggled: root.mutateSettings("notifications", "crashed", !checked) }
-              CompactToggleRow { width: parent.width; label: "Recovered"; checked: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.notifications.recovered : true; onToggled: root.mutateSettings("notifications", "recovered", !checked) }
+              CompactToggleRow { width: parent.width; label: "Unhealthy"; checked: root.settings && Object.keys(root.settings).length ? root.settings.notifications.unhealthy : true; onToggled: root.mutateSettings("notifications", "unhealthy", !checked) }
+              CompactToggleRow { width: parent.width; label: "Crashed"; checked: root.settings && Object.keys(root.settings).length ? root.settings.notifications.crashed : true; onToggled: root.mutateSettings("notifications", "crashed", !checked) }
+              CompactToggleRow { width: parent.width; label: "Recovered"; checked: root.settings && Object.keys(root.settings).length ? root.settings.notifications.recovered : true; onToggled: root.mutateSettings("notifications", "recovered", !checked) }
               PanelSeparator { width: parent.width }
               Button {
                 width: parent.width
@@ -630,8 +681,8 @@ Item {
                 spacing: Style.space(10)
 
                 PanelSectionHeader { text: "LOCAL PROXY" }
-                CompactToggleRow { width: parent.width; label: "HTTP proxy · " + (root.service && root.service.snapshot.settings ? root.service.snapshot.settings.proxy.listenHost : "127.0.0.1"); checked: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.proxy.enabled : false; onToggled: root.mutateSettings("proxy", "enabled", !checked) }
-                NumberField { width: parent.width; fieldWidth: parent.width; label: "HTTP port"; from: 1; to: 65535; value: root.service && root.service.snapshot.settings ? root.service.snapshot.settings.proxy.httpPort : 8088; onModified: function(value) { root.mutateSettings("proxy", "httpPort", value) } }
+                CompactToggleRow { width: parent.width; label: "HTTP proxy · " + (root.settings && Object.keys(root.settings).length ? root.settings.proxy.listenHost : "127.0.0.1"); checked: root.settings && Object.keys(root.settings).length ? root.settings.proxy.enabled : false; onToggled: root.mutateSettings("proxy", "enabled", !checked) }
+                NumberField { width: parent.width; fieldWidth: parent.width; label: "HTTP port"; from: 1; to: 65535; value: root.settings && Object.keys(root.settings).length ? root.settings.proxy.httpPort : 8088; onModified: function(value) { root.mutateSettings("proxy", "httpPort", value) } }
 
                 PanelSectionHeader { text: "COMPOSE IMPORT" }
                 Row { width: parent.width; spacing: Style.space(5)
@@ -655,6 +706,12 @@ Item {
                 Repeater { model: root.service && root.service.snapshot.diagnostics ? root.service.snapshot.diagnostics : []
                   Text { textFormat: Text.PlainText; required property var modelData; width: parent.width; text: modelData.code + " · " + modelData.message; color: modelData.level === "error" ? Color.urgent : Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap }
                 }
+                TextEdit {
+                  width: parent.width; visible: Boolean(root.service && root.service.maintenanceResult)
+                  text: root.service ? root.service.maintenanceResult || "" : ""
+                  textFormat: TextEdit.PlainText; readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere
+                  color: root.primaryText; font.family: Style.font.family; font.pixelSize: Style.font.caption
+                }
                 Text { textFormat: Text.PlainText; visible: Boolean(root.service && (!root.service.snapshot.diagnostics || root.service.snapshot.diagnostics.length === 0)); text: "󰄬 No diagnostics reported"; color: Color.accent; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
               }
               Item { width: 1; height: Style.space(8) }
@@ -677,10 +734,12 @@ Item {
           }
           PanelSeparator { width: parent.width }
           LogsView {
-            width: parent.width; height: Style.space(485)
+            width: parent.width; height: Math.max(0, parent.height-y)
             service: root.service && root.service.logsTarget === root.selectedProjectId ? root.selectedProject : root.selectedService
             entries: root.service ? root.service.logs : []
             loading: root.service ? root.service.logsLoading : false
+            notice: root.service ? root.service.logsNotice || "" : ""
+            showServiceLabels: Boolean(root.service && root.service.logsTarget === root.selectedProjectId)
             onRefreshRequested: function(query) { if (root.service && root.service.logsTarget) root.service.loadLogs(root.service.logsTarget, query) }
             onClearRequested: root.service.clearVisibleLogs()
             onCloseRequested: root.section = "stack"
@@ -703,20 +762,18 @@ Item {
     ProjectWizard {
       id: projectWizard; anchors.fill: parent
       onCanceled: opened = false
-      onCompleted: function(project) { opened = false; root.service.createProject(project) }
+      onCompleted: function(project) { root.saveEditor(projectWizard, root.service.createProject(project)) }
     }
     ProjectEditor {
       id: projectEditor; anchors.fill: parent
       onCanceled: opened = false
-      onSaved: function(project) { opened = false; root.service.updateProject(project) }
+      onSaved: function(project) { root.saveEditor(projectEditor, root.service.updateProject(project)) }
     }
     ServiceEditor {
       id: serviceEditor; anchors.fill: parent; allServices: root.allServices()
       onCanceled: opened = false
       onSaved: function(projectId, serviceData, editing) {
-        opened = false
-        if (editing) root.service.updateService(serviceData)
-        else root.service.createService(projectId, serviceData)
+        root.saveEditor(serviceEditor, editing ? root.service.updateService(serviceData) : root.service.createService(projectId, serviceData))
       }
     }
     ConfirmDialog {
@@ -724,7 +781,8 @@ Item {
       onCanceled: opened = false
       onConfirmed: {
         opened = false
-        if (root.pendingDeleteType === "project") root.service.deleteProject(root.pendingDeleteId)
+        if (root.pendingDeleteType === "kill") root.service.forceKill(root.pendingDeleteId)
+        else if (root.pendingDeleteType === "project") root.service.deleteProject(root.pendingDeleteId)
         else root.service.deleteService(root.pendingDeleteId)
       }
     }
@@ -734,6 +792,19 @@ Item {
       confirmText: "Replace"
       onCanceled: opened = false
       onConfirmed: { opened = false; root.service.request("config.import", { path: importPath.text.trim(), replace: true }) }
+    }
+  }
+
+  Connections {
+    target: root.service && root.service.requestFinished ? root.service : null
+    ignoreUnknownSignals: true
+    function onRequestFinished(token, method, success, message) {
+      if (token !== root.pendingSaveToken || !root.pendingEditor) return
+      root.pendingEditor.saving = false
+      root.pendingEditor.saveError = message
+      if (success) root.pendingEditor.opened = false
+      root.pendingEditor = null
+      root.pendingSaveToken = ""
     }
   }
 

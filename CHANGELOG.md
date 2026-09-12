@@ -5,9 +5,30 @@ Semantic Versioning.
 
 ## [Unreleased]
 
-- Added a browser action to compact service rows. It opens the configured
-  HTTP(S) URL or falls back to the first detected host/Docker port, and remains
-  disabled until the service is running.
+- Fixed empty panels under replacement bars whose scoped shell cannot return
+  OmaStack's shared service; the widget now owns a client when needed.
+- Added widget-specific live diagnostics and a build gate for QML regressions.
+- Retained offline project snapshots and removed misleading setup instructions
+  during disconnection.
+- Fixed project creation/reset failing because the arguments field shadowed
+  JavaScript's `arguments` object.
+- Packaging now rejects untracked source files as well as modified tracked files.
+
+- Added persistent browser/stop/overflow controls. Browser access uses the
+  configured URL, an active route, or an explicit port picker.
+- Made rejected configuration updates transactional, settings edits atomic,
+  and route uniqueness consistent across whitespace/case/trailing-dot aliases.
+- Bound oversized log-line draining, journal merging and queued health work;
+  old process/container generations cannot supply current readiness results.
+- Fixed targeted shutdown, dependency-aware session autostart and cancellation
+  of queued aggregate starts; shared Compose prerequisites have separate owners.
+- Prevented duplicate Compose stop signals with systemd `KillMode=mixed` and
+  allowed CLI completion time after the container's configured stop grace.
+- Preserved hidden editor fields, zero values, opaque arguments and IPv6;
+  failed saves retain the draft and successful saves wait for acknowledgment.
+- Improved narrow-panel scrolling, log readability, history settings, route
+  URLs/activity, recovery notification settings and bounded stale-state polling.
+- Added regression coverage and recorded final verification on 2026-09-12.
 
 ## [0.1.1] - 2026-09-02
 

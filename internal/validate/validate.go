@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
+	"omastack/internal/deps"
 	"omastack/internal/model"
 )
 
@@ -75,8 +77,19 @@ func Config(c model.Config) error {
 			seenServices[s.ID] = true
 		}
 	}
+	services := c.AllServices()
+	ids := make([]string, 0, len(services))
+	routes := map[string]bool{}
 	for _, p := range c.Projects {
 		for _, s := range p.Services {
+			ids = append(ids, s.ID)
+			if s.Route != nil {
+				host := CanonicalHostname(s.Route.Hostname)
+				if routes[host] {
+					return fmt.Errorf("duplicate route hostname %q", host)
+				}
+				routes[host] = true
+			}
 			for _, dep := range s.Dependencies {
 				if !seenServices[dep.ServiceID] {
 					return fmt.Errorf("service %q depends on unknown service %q", s.Name, dep.ServiceID)
@@ -84,8 +97,16 @@ func Config(c model.Config) error {
 				if dep.ServiceID == s.ID {
 					return fmt.Errorf("service %q depends on itself", s.Name)
 				}
+				prerequisite := services[dep.ServiceID]
+				if dep.Condition == "healthy" && prerequisite.Health == nil && prerequisite.Docker == nil {
+					return fmt.Errorf("service %q requires healthy dependency %q, which has no health check", s.Name, prerequisite.Name)
+				}
 			}
 		}
+	}
+	sort.Strings(ids)
+	if _, err := deps.StartupOrder(services, ids); err != nil {
+		return err
 	}
 	encoded, err := json.Marshal(c)
 	if err != nil {
@@ -328,8 +349,12 @@ func Path(label, value string, requireAbsolute bool) error {
 
 func Port(value int) bool { return value >= 1 && value <= 65535 }
 
+func CanonicalHostname(value string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+}
+
 func LocalHostname(value string) bool {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+	h := CanonicalHostname(value)
 	if len(h) < 3 || len(h) > 253 || !(strings.HasSuffix(h, ".test") || strings.HasSuffix(h, ".localhost")) {
 		return false
 	}

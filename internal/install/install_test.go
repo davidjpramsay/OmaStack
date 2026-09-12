@@ -26,6 +26,12 @@ func TestSecureDirectoryRejectsWritableExistingDirectory(t *testing.T) {
 	}
 }
 
+func TestServiceTemplateAvoidsDuplicateStopSignals(t *testing.T) {
+	if !strings.Contains(string(serviceUnit), "KillMode=mixed\n") || !strings.Contains(string(serviceUnit), "TimeoutStopSec=310s\n") {
+		t.Fatal("service template must signal the supervisor once and leave room for bounded Docker shutdown")
+	}
+}
+
 func TestSecureDirectoryCreatesPrivateDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new", "install")
 	if err := secureDirectory(path, 0o700); err != nil {
@@ -162,7 +168,8 @@ func TestSetupAndUninstallLifecycle(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"--user daemon-reload",
-		"--user enable --now omastackd.service",
+		"--user enable omastackd.service",
+		"--user restart omastackd.service",
 		"--user disable --now omastackd.service",
 		"--user stop omastack-service@" + serviceID + ".service",
 	} {

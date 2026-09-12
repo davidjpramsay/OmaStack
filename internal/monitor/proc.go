@@ -3,6 +3,7 @@ package monitor
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,11 +28,18 @@ type Aggregate struct {
 
 type Sampler struct {
 	procRoot   string
+	cgroupRoot string
 	previous   map[int]ProcSample
 	previousAt time.Time
 }
 
-func NewSampler() *Sampler { return &Sampler{procRoot: "/proc", previous: map[int]ProcSample{}} }
+func NewSampler() *Sampler {
+	return &Sampler{
+		procRoot:   "/proc",
+		cgroupRoot: "/sys/fs/cgroup",
+		previous:   map[int]ProcSample{},
+	}
+}
 
 func (s *Sampler) Sample(rootPID int, includePorts bool) (Aggregate, error) {
 	now := time.Now()
@@ -40,11 +48,17 @@ func (s *Sampler) Sample(rootPID int, includePorts bool) (Aggregate, error) {
 		return Aggregate{}, err
 	}
 	pids := Descendants(all, rootPID)
-	var ticks, bytes uint64
+	var ticks, rssBytes uint64
 	for _, pid := range pids {
 		sample := all[pid]
 		ticks += sample.Ticks
-		bytes += sample.RSSBytes
+		rssBytes += sample.RSSBytes
+	}
+	memoryBytes := rssBytes
+	if current, currentErr := readCgroupMemory(s.procRoot, s.cgroupRoot, rootPID); currentErr == nil {
+		memoryBytes = current
+	} else if pss, pssErr := readProcessTreePSS(s.procRoot, pids); pssErr == nil {
+		memoryBytes = pss
 	}
 	var previousTicks uint64
 	for _, pid := range pids {
@@ -58,11 +72,98 @@ func (s *Sampler) Sample(rootPID int, includePorts bool) (Aggregate, error) {
 		}
 	}
 	s.previous, s.previousAt = all, now
-	result := Aggregate{CPU: cpu, MemoryMB: float64(bytes) / (1024 * 1024), PIDs: pids}
+	result := Aggregate{CPU: cpu, MemoryMB: float64(memoryBytes) / (1024 * 1024), PIDs: pids}
 	if includePorts {
 		result.Ports, _ = ListeningPorts(s.procRoot, pids)
 	}
 	return result, nil
+}
+
+// readCgroupMemory returns the current memory charged to the cgroup containing
+// pid. On cgroup v2 this accounts shared pages once at the service boundary,
+// unlike summing the RSS of every process in a Chromium-style process tree.
+func readCgroupMemory(procRoot, cgroupRoot string, pid int) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return 0, err
+	}
+	cgroupPath, err := parseCgroupV2Path(string(data))
+	if err != nil {
+		return 0, err
+	}
+	relative := strings.TrimPrefix(cgroupPath, "/")
+	data, err = os.ReadFile(filepath.Join(cgroupRoot, filepath.FromSlash(relative), "memory.current"))
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse cgroup memory.current: %w", err)
+	}
+	return value, nil
+}
+
+func parseCgroupV2Path(content string) (string, error) {
+	for _, line := range strings.Split(content, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(parts) != 3 || parts[0] != "0" || parts[1] != "" {
+			continue
+		}
+		path := parts[2]
+		if !strings.HasPrefix(path, "/") || filepath.Clean(path) != path {
+			return "", errors.New("invalid cgroup v2 path")
+		}
+		return path, nil
+	}
+	return "", errors.New("cgroup v2 entry not found")
+}
+
+// readProcessTreePSS is the compatibility fallback when cgroup-v2 accounting
+// is unavailable. PSS apportions shared pages between processes instead of
+// charging the complete shared mapping to every process as RSS does.
+func readProcessTreePSS(procRoot string, pids []int) (uint64, error) {
+	if len(pids) == 0 {
+		return 0, errors.New("empty process tree")
+	}
+	var total uint64
+	for _, pid := range pids {
+		bytes, err := readProcessPSS(procRoot, pid)
+		if err != nil {
+			return 0, err
+		}
+		if ^uint64(0)-total < bytes {
+			return 0, errors.New("process tree PSS overflow")
+		}
+		total += bytes
+	}
+	return total, nil
+}
+
+func readProcessPSS(procRoot string, pid int) (uint64, error) {
+	file, err := os.Open(filepath.Join(procRoot, strconv.Itoa(pid), "smaps_rollup"))
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[0] != "Pss:" {
+			continue
+		}
+		kilobytes, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse process %d PSS: %w", pid, err)
+		}
+		if kilobytes > ^uint64(0)/1024 {
+			return 0, fmt.Errorf("process %d PSS overflow", pid)
+		}
+		return kilobytes * 1024, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return 0, fmt.Errorf("process %d PSS not found", pid)
 }
 
 func ReadProcesses(procRoot string) (map[int]ProcSample, error) {

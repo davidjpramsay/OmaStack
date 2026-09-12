@@ -6,6 +6,9 @@
   vulnerabilities that are reachable from OmaStack's HTTP and certificate
   handling paths.
 - `make` is optional; the documented build uses `go build` directly.
+- Qt Quick Test (`qmltestrunner`, supplied by Arch's `qt6-declarative`) and the
+  installed Omarchy shell modules are required by the build's QML test gate.
+- Bash and `jq` are used by the installation and manifest validation scripts.
 
 The backend uses only the Go standard library. There are no Go module downloads
 and no vendored third-party runtime libraries.

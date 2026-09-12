@@ -21,6 +21,7 @@ crates for this particular plugin. The build requires Go 1.25.13 or newer.
 | Component | Responsibility | Lifetime |
 |---|---|---|
 | `qml/BarWidget.qml` | Compact global counts and panel launcher | Omarchy shell |
+| `qml/BackendConnection.qml` | Reuse the host service or create a widget-owned client for restricted replacement bars | Widget lifetime |
 | `qml/CompactPanel.qml` | Native single-column project/service panel, logs, routes, settings and editors | On demand |
 | `qml/Panel.qml` | Compatibility wrapper for older local installs | On demand |
 | `qml/Service.qml` | Read-only snapshot watcher, serialized CLI requests and shell IPC | Omarchy shell |
@@ -33,6 +34,14 @@ The QML-to-daemon boundary is intentionally narrow. The shell reads a mode
 The CLI connects to a mode `0600` Unix socket; the daemon also verifies Linux
 `SO_PEERCRED` and rejects peers whose UID is not the daemon's UID.
 
+Replacement bars expose a scoped shell facade whose service lookup can return
+null. The widget must not assume that `bar.shell.serviceFor` supplies its
+service. `BackendConnection` falls back to its own `Service` client with IPC
+registration disabled. The daemon and supervisor remain shared; no second
+daemon or service unit is started. `david.omastack.widget status` reports the
+actual panel binding, while `david.omastack status` reports the persistent shell
+service. Both must be checked during native acceptance.
+
 Configuration and lifecycle mutations share one interruptible operation gate.
 This prevents imports, edits, deletion and lifecycle requests from racing each
 other; stop, kill and restart can cancel a long dependency-health wait. The
@@ -44,10 +53,14 @@ deadlines so a same-user client cannot grow backend memory without bound.
 Each project and service receives a UUIDv4. Unit names use only service IDs,
 so renaming or reordering a project cannot orphan a unit. Dependency startup
 uses a topological ordering and supports `started` and `healthy` conditions;
-shutdown reverses the dependency order. Systemd prevents duplicate template
+shutdown reverses the dependency order only within the requested selection.
+Systemd prevents duplicate template
 unit activation. The supervisor places the command in a new process group,
 forwards the configured stop signal, waits for the grace period and escalates
-to `SIGKILL`.
+to `SIGKILL`. `KillMode=mixed` delivers the initial signal only to the
+supervisor, avoiding duplicate signals to Compose; systemd retains final
+whole-cgroup cleanup. Docker gets five seconds of CLI completion margin after
+its configured container stop grace, within the unit's 310-second limit.
 
 The backend reconstructs state from systemd and durable supervisor records on
 every start. Shell reloads have no effect on service units. The panel tells the
@@ -79,10 +92,15 @@ request, strips the stream prefix, redacts again, and merges project logs by
 timestamp. The QML view has a bounded query, pause/resume polling, selectable
 text and a clear-visible-buffer action that never deletes journal data.
 
-Host metrics are aggregated across the service process tree from `/proc`.
-Listening TCP sockets are matched by inode only every few seconds. Docker
-Compose services use `compose ps` and `docker stats` on a slower bounded poll
-for state, health, CPU, memory and published ports.
+Host CPU and port metrics are aggregated across the service process tree from
+`/proc`. Memory comes from the service's cgroup-v2 `memory.current`, which
+charges shared mappings once at the systemd service boundary instead of once
+per Electron/Chromium child process. Systems without readable cgroup-v2
+accounting fall back to process proportional set size (PSS), with summed RSS
+retained only as a final compatibility fallback. Listening TCP sockets are
+matched by inode only every few seconds. Docker Compose services use
+`compose ps` and `docker stats` on a slower bounded poll for state, health,
+CPU, memory and published ports.
 
 ## Health and routing
 

@@ -9,6 +9,8 @@ Item {
   property var entries: []
   property bool loading: false
   property bool paused: false
+  property bool showServiceLabels: true
+  property string notice: ""
   property string query: ""
   property color foreground: Color.foreground
   signal refreshRequested(string query)
@@ -29,6 +31,7 @@ Item {
     spacing: Style.space(8)
 
     Row {
+      id: searchRow
       width: parent.width
       spacing: Style.space(6)
       TextField {
@@ -70,9 +73,19 @@ Item {
       }
     }
 
+    Text { textFormat: Text.PlainText;
+      id: limitNotice
+      width: parent.width
+      visible: root.notice !== ""
+      text: root.notice
+      color: Color.urgent
+      font.family: Style.font.family; font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
     BorderSurface {
       width: parent.width
-      height: parent.height - search.height - Style.space(8)
+      height: Math.max(0, parent.height - searchRow.height - Style.space(8) - (limitNotice.visible ? limitNotice.height + Style.space(8) : 0))
       color: Util.alpha(Color.background, 0.38)
       borderSpec: Border.flat(Util.alpha(root.foreground, 0.16), Style.normalBorderWidth)
       radius: Style.cornerRadius
@@ -85,19 +98,26 @@ Item {
         model: root.visibleEntries()
         spacing: Style.space(2)
         clip: true
+        Controls.ScrollBar.vertical: Controls.ScrollBar {}
         onCountChanged: if (!root.paused && count > 0) positionViewAtEnd()
 
-        delegate: Row {
+        delegate: Column {
+          id: logEntry
           required property var modelData
           width: logList.width
-          spacing: Style.space(7)
+          spacing: Style.space(3)
+          Row {
+            width: parent.width
+            spacing: Style.space(7)
           Text { textFormat: Text.PlainText;
+            id: timestampLabel
             text: String(modelData.timestamp || "").substring(11, 23)
             color: Color.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
           Text { textFormat: Text.PlainText;
+            id: streamLabel
             text: modelData.stream === "stderr" ? "ERR" : "OUT"
             color: modelData.stream === "stderr" ? Color.urgent : Color.accent
             font.family: Style.font.family
@@ -105,14 +125,17 @@ Item {
             font.bold: true
           }
           Text { textFormat: Text.PlainText;
-            visible: Boolean(modelData.service)
+            width: Math.max(0, parent.width - timestampLabel.width - streamLabel.width - parent.spacing*2)
+            visible: root.showServiceLabels && Boolean(modelData.service)
             text: modelData.service || ""
             color: Color.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
           }
           TextEdit {
-            width: parent.width - x
+            width: parent.width
             textFormat: TextEdit.PlainText
             text: modelData.message || ""
             color: root.foreground
@@ -128,6 +151,9 @@ Item {
           anchors.centerIn: parent
           visible: logList.count === 0
           text: root.loading ? "Loading logs…" : (root.service ? "No matching journal entries" : "Choose a service to inspect its logs")
+          width: parent.width
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.WordWrap
           color: Color.muted
           font.family: Style.font.family
           font.pixelSize: Style.font.body

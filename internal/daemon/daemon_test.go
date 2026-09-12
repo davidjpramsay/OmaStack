@@ -114,12 +114,9 @@ func TestBoundLogEntriesKeepsNewestWithinBudget(t *testing.T) {
 	if len(bounded) == 0 || bounded[len(bounded)-1].ServiceID != "three" {
 		t.Fatalf("newest entry not retained: %#v", bounded)
 	}
-	total := 0
-	for _, entry := range bounded {
-		total += 256 + len(entry.ServiceID) + len(entry.Service) + len(entry.Stream) + len(entry.Message)
-	}
-	if total > 1300 {
-		t.Fatalf("bounded log cost = %d", total)
+	encoded, _ := json.Marshal(bounded)
+	if len(encoded) > 1300 {
+		t.Fatalf("bounded JSON log cost = %d", len(encoded))
 	}
 }
 

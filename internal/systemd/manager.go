@@ -23,6 +23,7 @@ type UnitState struct {
 	ExecMainCode   int
 	ExecMainStatus int
 	NRestarts      int
+	InvocationID   string
 }
 
 func UnitName(serviceID string) (string, error) {
@@ -60,7 +61,7 @@ func (m Manager) Show(ctx context.Context, serviceID string) (UnitState, error) 
 	if err != nil {
 		return UnitState{}, err
 	}
-	output, err := m.run(ctx, "show", "--no-pager", "--property=ActiveState,SubState,MainPID,Result,ExecMainCode,ExecMainStatus,NRestarts", unit)
+	output, err := m.run(ctx, "show", "--no-pager", "--property=ActiveState,SubState,MainPID,Result,ExecMainCode,ExecMainStatus,NRestarts,InvocationID", unit)
 	if err != nil {
 		return UnitState{}, err
 	}
@@ -71,9 +72,13 @@ func (m Manager) Show(ctx context.Context, serviceID string) (UnitState, error) 
 			values[key] = value
 		}
 	}
+	if values["ActiveState"] == "" {
+		return UnitState{}, errors.New("systemd returned no unit state")
+	}
 	return UnitState{
 		ActiveState: values["ActiveState"], SubState: values["SubState"], Result: values["Result"],
-		MainPID: integer(values["MainPID"]), ExecMainCode: integer(values["ExecMainCode"]), ExecMainStatus: integer(values["ExecMainStatus"]), NRestarts: integer(values["NRestarts"]),
+		InvocationID: values["InvocationID"],
+		MainPID:      integer(values["MainPID"]), ExecMainCode: integer(values["ExecMainCode"]), ExecMainStatus: integer(values["ExecMainStatus"]), NRestarts: integer(values["NRestarts"]),
 	}, nil
 }
 

@@ -26,20 +26,28 @@ type Availability struct {
 }
 
 type ImportedService struct {
-	Name    string   `json:"name"`
-	Command []string `json:"command,omitempty"`
-	Ports   []string `json:"ports,omitempty"`
+	Name         string              `json:"name"`
+	Command      []string            `json:"command,omitempty"`
+	Ports        []string            `json:"ports,omitempty"`
+	Dependencies []ComposeDependency `json:"dependencies,omitempty"`
+}
+
+type ComposeDependency struct {
+	Service   string `json:"service"`
+	Condition string `json:"condition"`
+	Required  bool   `json:"required"`
 }
 
 type ContainerState struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	State     string  `json:"state"`
-	Health    string  `json:"health"`
-	ExitCode  int     `json:"exitCode"`
-	Published []int   `json:"publishedPorts"`
-	CPU       float64 `json:"cpu"`
-	MemoryMB  float64 `json:"memoryMb"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	State     string    `json:"state"`
+	Health    string    `json:"health"`
+	ExitCode  int       `json:"exitCode"`
+	Published []int     `json:"publishedPorts"`
+	CPU       float64   `json:"cpu"`
+	MemoryMB  float64   `json:"memoryMb"`
+	StartedAt time.Time `json:"startedAt"`
 }
 
 type composePS struct {
@@ -96,8 +104,12 @@ func ImportCompose(ctx context.Context, composeFile string) ([]ImportedService, 
 	}
 	var document struct {
 		Services map[string]struct {
-			Command any `json:"command"`
-			Ports   []struct {
+			Command   any `json:"command"`
+			DependsOn map[string]struct {
+				Condition string `json:"condition"`
+				Required  *bool  `json:"required"`
+			} `json:"depends_on"`
+			Ports []struct {
 				Published string `json:"published"`
 				Target    int    `json:"target"`
 			} `json:"ports"`
@@ -110,6 +122,14 @@ func ImportCompose(ctx context.Context, composeFile string) ([]ImportedService, 
 	result := make([]ImportedService, 0, len(document.Services))
 	for name, service := range document.Services {
 		entry := ImportedService{Name: name}
+		for dependency, options := range service.DependsOn {
+			condition := options.Condition
+			if condition == "" {
+				condition = "service_started"
+			}
+			entry.Dependencies = append(entry.Dependencies, ComposeDependency{Service: dependency, Condition: condition, Required: options.Required == nil || *options.Required})
+		}
+		sort.Slice(entry.Dependencies, func(i, j int) bool { return entry.Dependencies[i].Service < entry.Dependencies[j].Service })
 		switch command := service.Command.(type) {
 		case string:
 			entry.Command = []string{command}
@@ -134,11 +154,19 @@ func composeConfigArguments() []string {
 }
 
 func Inspect(ctx context.Context, composeFile, projectName, service string) (ContainerState, error) {
+	return inspect(ctx, composeFile, projectName, service, true)
+}
+
+func InspectHealth(ctx context.Context, composeFile, projectName, service string) (ContainerState, error) {
+	return inspect(ctx, composeFile, projectName, service, false)
+}
+
+func inspect(ctx context.Context, composeFile, projectName, service string, stats bool) (ContainerState, error) {
 	args := []string{"compose", "-f", composeFile}
 	if projectName != "" {
 		args = append(args, "--project-name", projectName)
 	}
-	args = append(args, "ps", "--format", "json", service)
+	args = append(args, "ps", "--all", "--format", "json", service)
 	callCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	output, err := runCombined(callCtx, 8<<20, "docker", args...)
@@ -154,6 +182,26 @@ func Inspect(ctx context.Context, composeFile, projectName, service string) (Con
 	}
 	record := records[0]
 	result := ContainerState{ID: record.ID, Name: record.Name, State: strings.ToLower(record.State), Health: strings.ToLower(record.Health), ExitCode: record.ExitCode}
+	// Compose's process can outlive several container replacements/restarts.
+	// Read actual container state so readiness is tied to this container run.
+	if result.ID != "" {
+		output, err := runCombined(callCtx, 64<<10, "docker", "inspect", "--format", "{{json .State}}", result.ID)
+		if err != nil {
+			return ContainerState{}, fmt.Errorf("docker inspect: %s", concise(output, err))
+		}
+		var state struct {
+			Status    string    `json:"Status"`
+			StartedAt time.Time `json:"StartedAt"`
+			ExitCode  int       `json:"ExitCode"`
+			Health    struct {
+				Status string `json:"Status"`
+			} `json:"Health"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(output), &state); err != nil {
+			return ContainerState{}, fmt.Errorf("parse Docker state: %w", err)
+		}
+		result.State, result.Health, result.ExitCode, result.StartedAt = strings.ToLower(state.Status), strings.ToLower(state.Health.Status), state.ExitCode, state.StartedAt
+	}
 	for _, publisher := range record.Publishers {
 		if publisher.PublishedPort > 0 {
 			result.Published = append(result.Published, publisher.PublishedPort)
@@ -163,7 +211,7 @@ func Inspect(ctx context.Context, composeFile, projectName, service string) (Con
 	if len(result.Published) > 256 {
 		result.Published = result.Published[:256]
 	}
-	if result.ID != "" && result.State == "running" {
+	if stats && result.ID != "" && result.State == "running" {
 		result.CPU, result.MemoryMB, _ = inspectStats(callCtx, result.ID)
 	}
 	return result, nil
@@ -252,11 +300,11 @@ func OpenTerminal(ctx context.Context, composeFile, projectName, service string)
 
 func Action(ctx context.Context, composeFile, projectName, service, action string) error {
 	allowed := map[string][]string{
-		"start":    {"up", "--detach", "--no-build"},
+		"start":    {"up", "--detach", "--no-build", "--no-deps"},
 		"stop":     {"stop"},
-		"restart":  {"restart"},
+		"restart":  {"restart", "--no-deps"},
 		"rebuild":  {"build"},
-		"recreate": {"up", "--detach", "--force-recreate"},
+		"recreate": {"up", "--detach", "--force-recreate", "--no-deps"},
 	}
 	verb, ok := allowed[action]
 	if !ok {

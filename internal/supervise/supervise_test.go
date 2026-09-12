@@ -34,6 +34,25 @@ func TestCommandArgumentsAreNotShellJoined(t *testing.T) {
 	}
 }
 
+func TestComposeSupervisorOwnsOnlySelectedService(t *testing.T) {
+	command, args, err := commandFor(model.Service{Docker: &model.DockerSpec{ComposeFile: "/tmp/compose.yaml", ProjectName: "fixture", Service: "web"}, GracefulStopSeconds: 300})
+	want := []string{"compose", "-f", "/tmp/compose.yaml", "--project-name", "fixture", "up", "--no-color", "--no-build", "--no-deps", "--timeout", "300", "web"}
+	if err != nil || command != "docker" || !reflect.DeepEqual(args, want) {
+		t.Fatalf("command=%s args=%v err=%v", command, args, err)
+	}
+}
+
+func TestComposeShutdownBudgetIncludesCLICompletion(t *testing.T) {
+	s := model.Service{GracefulStopSeconds: 300}
+	if shutdownWait(s) != 300*time.Second {
+		t.Fatal("host grace changed")
+	}
+	s.Docker = &model.DockerSpec{}
+	if shutdownWait(s) != 305*time.Second {
+		t.Fatal("container stop races supervisor timeout")
+	}
+}
+
 func TestRunOnceStopsProcessGroupOnCancellation(t *testing.T) {
 	dir := t.TempDir()
 	resolved := paths.Paths{RuntimeServicesDir: dir}

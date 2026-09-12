@@ -28,7 +28,7 @@ import (
 	"omastack/internal/supervise"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -156,6 +156,10 @@ func client(resolved paths.Paths) control.Client {
 
 func clientForMethod(resolved paths.Paths, method string) control.Client {
 	result := client(resolved)
+	if method == "stop" || method == "restart" {
+		result.Timeout = 12*time.Hour + 10*time.Second
+		return result
+	}
 	if method == "start" || method == "restart" || method == "docker.action" {
 		result.Timeout = 6 * time.Minute
 	} else if method == "stop" || method == "kill" || method == "config.import" {
@@ -195,7 +199,7 @@ func showStatus(ctx context.Context, resolved paths.Paths, detailed bool, args [
 			for i, port := range runtime.Ports {
 				ports[i] = fmt.Sprint(port)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%.1f%%\t%.1f MB\t%s\t%s\n", project.Name, service.Name, runtime.Status, runtime.PID, runtime.CPU, runtime.MemoryMB, strings.Join(ports, ","), duration(runtime.UptimeSeconds))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%.1f%%\t%.1f MiB\t%s\t%s\n", project.Name, service.Name, runtime.Status, runtime.PID, runtime.CPU, runtime.MemoryMB, strings.Join(ports, ","), duration(runtime.UptimeSeconds))
 			if detailed && runtime.LastError != "" {
 				fmt.Fprintf(w, "\t↳ %s\n", runtime.LastError)
 			}
@@ -210,6 +214,7 @@ func logsCommand(ctx context.Context, resolved paths.Paths, args []string) error
 	query := flags.String("query", "", "case-insensitive search")
 	asJSON := flags.Bool("json", false, "print JSON")
 	follow := flags.Bool("follow", false, "continue following logs")
+	metadata := flags.Bool("metadata", false, "include log-limit metadata with --json")
 	target := ""
 	flagArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -227,15 +232,31 @@ func logsCommand(ctx context.Context, resolved paths.Paths, args []string) error
 	if *asJSON && *follow {
 		return errors.New("--json and --follow cannot be combined")
 	}
+	if *metadata && !*asJSON {
+		return errors.New("--metadata requires --json")
+	}
 	params := control.LogsParams{Target: target, Lines: *lines, Query: *query}
 	seen := map[string]bool{}
 	printEntries := func() error {
-		var entries []map[string]any
-		if err := client(resolved).Call(ctx, "logs", params, &entries); err != nil {
+		var result struct {
+			Entries   []map[string]any `json:"entries"`
+			Truncated bool             `json:"truncated"`
+			Limit     int              `json:"limit"`
+			Notice    string           `json:"notice,omitempty"`
+		}
+		params.Metadata = true
+		if err := client(resolved).Call(ctx, "logs", params, &result); err != nil {
 			return err
 		}
+		entries := result.Entries
 		if *asJSON {
+			if *metadata {
+				return printJSON(result)
+			}
 			return printJSON(entries)
+		}
+		if result.Truncated {
+			fmt.Fprintln(os.Stderr, "omastack:", result.Notice)
 		}
 		for _, entry := range entries {
 			key := fmt.Sprint(entry["timestamp"], "\x00", entry["serviceId"], "\x00", entry["stream"], "\x00", entry["message"])

@@ -12,7 +12,11 @@ Ui.Panel {
   moduleName: "david.omastack"
   ipcTarget: "david.omastack.panel"
 
-  readonly property var stack: bar && bar.shell ? bar.shell.serviceFor(moduleName) : null
+  readonly property var stack: backendConnection.service
+  BackendConnection {
+    id: backendConnection
+    hostShell: root.bar ? root.bar.shell : null
+  }
   readonly property int runningCount: stack ? stack.runningCount : 0
   readonly property int stoppedCount: stack ? stack.stoppedCount : 0
   readonly property int unhealthyCount: stack ? stack.unhealthyCount : 0
@@ -83,6 +87,7 @@ Ui.Panel {
 
       Text { textFormat: Text.PlainText;
         anchors.verticalCenter: parent.verticalCenter
+        anchors.verticalCenterOffset: 1
         text: "󰆍"
         color: root.hasAttention ? root.urgent : root.foreground
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -154,6 +159,20 @@ Ui.Panel {
     command: []
     onExited: function(exitCode) {
       if (exitCode !== 0 && root.stack) root.stack.lastError = "Could not update the OmaStack bar counters"
+    }
+  }
+
+  // Inspect the actual widget binding, independently of the persistent
+  // service's IPC status (which can be healthy while this panel is empty).
+  IpcHandler {
+    target: "david.omastack.widget"
+    function status(): string {
+      return JSON.stringify({ connected: panelContent.connected,
+        projects: panelContent.projects.map(function(project) { return project.name }),
+        projectIds: panelContent.projects.map(function(project) { return project.id }),
+        visibleProjectCount: panelContent.visibleProjectCount,
+        client: backendConnection.sharedService ? "shared" : "local",
+        opened: root.opened, error: root.stack ? root.stack.lastError : "Client unavailable" })
     }
   }
 }

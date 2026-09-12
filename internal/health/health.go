@@ -60,15 +60,15 @@ func NewChecker(maxConcurrent int) *Checker {
 }
 
 func (c *Checker) Check(ctx context.Context, check model.HealthCheck) error {
+	// Queueing is part of the probe's budget, not an unbounded prelude to it.
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(check.TimeoutSeconds)*time.Second)
+	defer cancel()
 	select {
 	case c.semaphore <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-callCtx.Done():
+		return callCtx.Err()
 	}
 	defer func() { <-c.semaphore }()
-	timeout := time.Duration(check.TimeoutSeconds) * time.Second
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	switch check.Type {
 	case "http", "https":
 		return checkHTTP(callCtx, check.HTTP)
@@ -86,6 +86,7 @@ func checkHTTP(ctx context.Context, spec *model.HTTPCheck) error {
 		return errors.New("missing HTTP check")
 	}
 	client := newHTTPClient()
+	defer client.CloseIdleConnections()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
 	if err != nil {
 		return err
@@ -149,10 +150,44 @@ func checkCommand(ctx context.Context, spec *model.CommandSpec) error {
 }
 
 type Registry struct {
-	mu     sync.Mutex
-	states map[string]State
+	mu       sync.Mutex
+	states   map[string]State
+	runs     map[string]string
+	versions map[string]uint64
 }
 
-func NewRegistry() *Registry                   { return &Registry{states: map[string]State{}} }
+func NewRegistry() *Registry {
+	return &Registry{states: map[string]State{}, runs: map[string]string{}, versions: map[string]uint64{}}
+}
 func (r *Registry) Get(id string) State        { r.mu.Lock(); defer r.mu.Unlock(); return r.states[id] }
 func (r *Registry) Set(id string, state State) { r.mu.Lock(); r.states[id] = state; r.mu.Unlock() }
+
+// Observe ties cached health and in-flight results to one process/configuration.
+func (r *Registry) Observe(id, run string) (State, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runs[id] != run {
+		r.runs[id] = run
+		r.versions[id]++
+		delete(r.states, id)
+	}
+	return r.states[id], r.versions[id]
+}
+
+func (r *Registry) Reset(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.runs, id)
+	delete(r.states, id)
+	r.versions[id]++
+}
+
+func (r *Registry) Commit(id string, version uint64, state State) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.versions[id] != version {
+		return false
+	}
+	r.states[id] = state
+	return true
+}

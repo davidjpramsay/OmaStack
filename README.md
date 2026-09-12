@@ -12,7 +12,8 @@ Electron app, browser wrapper or standalone GTK dashboard.
 
 ## Current capabilities
 
-- Project and service create/edit/duplicate/reorder/delete workflows.
+- Project and service create/edit/duplicate/delete workflows; project ordering
+  is also available through the API.
 - Executable-plus-argument commands, explicit shell mode, working directory,
   environment and mode-`0600` secret storage.
 - Persistent `systemd --user` units with dependency ordering, reverse shutdown,
@@ -58,6 +59,20 @@ plugin to `~/.config/omarchy/plugins/david.omastack/`, installs user-level
 systemd units and enables the bar widget. It never modifies
 `/usr/share/omarchy/` and never uses root.
 
+The build runs both Go and QML regression tests. The widget works with the
+stock bar and replacement bars: when a bar cannot supply its service object,
+it creates its own client of the same backend.
+
+After installing, verify the actual widget connection from your desktop session:
+
+```bash
+omarchy restart shell
+bash scripts/check-live.sh
+```
+
+This check must show the same projects as the backend. A healthy
+`omastack status` alone does not verify the panel connection.
+
 For a published repository install, copy its HTTPS or SSH Git URL and use:
 
 ```bash
@@ -78,11 +93,16 @@ Tab moves through native controls, Enter/Space activates them and Escape closes
 the log view or panel. Click a project to expand it; click a service for inline
 metrics, or right-click it to edit.
 
-For a running web service, hover or keyboard-focus its row and press the globe
-button. OmaStack opens the service's configured URL, or falls back to the first
-detected host/Docker port at `http://127.0.0.1:<port>`. Set an exact URL on the
-service editor's **Web** tab when the app uses a specific path, hostname or
-HTTPS.
+For a running web service, press the always-visible globe button. OmaStack
+opens its configured URL or active local route. Otherwise, choose a detected
+port explicitly: a TCP port is not necessarily an HTTP application. Set an
+exact URL on the service editor's **Web** tab for one-click access.
+
+Starting a service includes its prerequisites. Stopping or restarting it stops
+only the selected service, not shared prerequisites. Native Compose dependencies
+must be registered in OmaStack with the same Compose file and project name;
+each runs under its own supervisor. Missing required dependencies produce an
+error before startup, rather than launching unmanaged containers.
 
 The bar shows four small counts—running, stopped, unhealthy and crashed—next to
 the icon by default. Open the panel's gear menu and switch off **Appearance →
@@ -130,6 +150,7 @@ health checks, secrets, routes and restart policies. Replace its illustrative
 
 ```bash
 omarchy plugin update david.omastack
+cd "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/david.omastack"
 ./scripts/build.sh && ./bin/omastack setup
 
 omarchy plugin disable david.omastack    # definitions and managed units remain
@@ -142,6 +163,9 @@ omastack uninstall --purge               # interactive: type PURGE
 `--purge --yes` exists for explicit non-interactive automation. Purge removes
 only validated XDG directories whose basename is exactly `omastack`; it refuses
 symlink targets. See [docs/storage.md](docs/storage.md) for every path.
+
+Setup restarts an already-running OmaStack daemon to load the new binary. It
+does not restart managed services or repeat session autostart for stopped apps.
 
 ## Development and verification
 

@@ -4,7 +4,7 @@ import QtQuick.Layouts as Layouts
 import qs.Commons
 import qs.Ui
 
-Item {
+FocusScope {
   id: root
   property bool opened: false
   property bool editing: false
@@ -12,14 +12,34 @@ Item {
   property var source: null
   property var allServices: []
   property int page: 0
+  property bool saving: false
+  property string saveError: ""
+  property string initialDraft: ""
   signal canceled()
   signal saved(string projectId, var serviceData, bool editing)
 
   ListModel { id: environmentRows }
 
+  function clone(value) { return JSON.parse(JSON.stringify(value)) }
+  function numberOr(value, fallback) { return value === undefined || value === null ? fallback : Number(value) }
+  function cancelEditor() {
+    if (saving) return
+    if (JSON.stringify(buildService()) !== initialDraft) discardDialog.opened = true
+    else canceled()
+  }
+
+  Keys.onEscapePressed: function(event) {
+    if (discardDialog.opened) discardDialog.opened = false
+    else cancelEditor()
+    event.accepted = true
+  }
+  Keys.onPressed: function(event) { if (discardDialog.opened && discardDialog.handleKey(event)) event.accepted = true }
+
   function begin(project, serviceData) {
     projectId = project || ""
-    source = serviceData || null
+    source = serviceData ? clone(serviceData) : null
+    saving = false
+    saveError = ""
     editing = Boolean(serviceData && serviceData.id)
     page = 0
     environmentRows.clear()
@@ -36,7 +56,7 @@ Item {
     for (var key in environment) environmentRows.append({ keyText: key, valueText: String(environment[key].value || ""), secretValue: environment[key].secret === true })
     autostartToggle.checked = Boolean(serviceData && serviceData.autostart)
     restartMode.value = serviceData && serviceData.restart ? String(serviceData.restart.mode || "never") : "never"
-    restartDelay.value = serviceData && serviceData.restart ? Number(serviceData.restart.delaySeconds || 1) : 1
+    restartDelay.value = serviceData && serviceData.restart ? numberOr(serviceData.restart.delaySeconds, 1) : 1
     restartAttempts.value = serviceData && serviceData.restart ? Number(serviceData.restart.maxAttempts || 0) : 0
     stopSignal.value = serviceData ? String(serviceData.stopSignal || "SIGTERM") : "SIGTERM"
     stopTimeout.value = serviceData ? Number(serviceData.gracefulStopSeconds || 10) : 10
@@ -46,7 +66,7 @@ Item {
     healthInterval.value = serviceData && serviceData.health ? Number(serviceData.health.intervalSeconds || 10) : 10
     healthTimeout.value = serviceData && serviceData.health ? Number(serviceData.health.timeoutSeconds || 3) : 3
     healthRetries.value = serviceData && serviceData.health ? Number(serviceData.health.retries || 3) : 3
-    healthGrace.value = serviceData && serviceData.health ? Number(serviceData.health.startGraceSeconds || 5) : 5
+    healthGrace.value = serviceData && serviceData.health ? numberOr(serviceData.health.startGraceSeconds, 5) : 5
     healthExpected.value = serviceData && serviceData.health && serviceData.health.http ? Number(serviceData.health.http.expectedStatus || 200) : 200
     responseContains.text = serviceData && serviceData.health && serviceData.health.http ? String(serviceData.health.http.responseContains || "") : ""
     urlField.text = serviceData ? String(serviceData.url || "") : ""
@@ -58,12 +78,17 @@ Item {
     composeFileField.text = serviceData && serviceData.docker ? String(serviceData.docker.composeFile || "") : ""
     composeServiceField.text = serviceData && serviceData.docker ? String(serviceData.docker.service || "") : ""
     opened = true
+    initialDraft = JSON.stringify(buildService())
+    Qt.callLater(function() { nameField.forceActiveFocus() })
   }
 
   function healthTargetFor(health) {
     if (!health) return ""
     if (health.http) return String(health.http.url || "")
-    if (health.tcp) return String(health.tcp.host || "127.0.0.1") + ":" + String(health.tcp.port || "")
+    if (health.tcp) {
+      var host = String(health.tcp.host || "127.0.0.1")
+      return (host.indexOf(":") >= 0 ? "[" + host + "]" : host) + ":" + String(health.tcp.port || "")
+    }
     if (health.command) return [health.command.executable].concat(health.command.arguments || []).join("\n")
     return ""
   }
@@ -72,13 +97,22 @@ Item {
     if (healthType.value === "none") return null
     var common = { type: healthType.value, intervalSeconds: healthInterval.value, timeoutSeconds: healthTimeout.value, retries: healthRetries.value, startGraceSeconds: healthGrace.value }
     if (healthType.value === "http" || healthType.value === "https") {
-      common.http = { url: healthTarget.text.trim(), expectedStatus: healthExpected.value, responseContains: responseContains.text, responseRegex: "", skipTLSVerify: false }
+      common.http = source && source.health && source.health.http ? clone(source.health.http) : {}
+      common.http.url = healthTarget.text.trim()
+      common.http.expectedStatus = healthExpected.value
+      common.http.responseContains = responseContains.text
     } else if (healthType.value === "tcp") {
-      var parts = healthTarget.text.trim().split(":")
-      common.tcp = { host: parts.length > 1 ? parts[0] : "127.0.0.1", port: Number(parts.length > 1 ? parts[1] : parts[0]) }
+      var target = healthTarget.text.trim()
+      var split = target.lastIndexOf(":")
+      var host = split >= 0 ? target.substring(0, split) : "127.0.0.1"
+      if (host.charAt(0) === "[" && host.charAt(host.length-1) === "]") host = host.substring(1,host.length-1)
+      common.tcp = { host: host, port: Number(split >= 0 ? target.substring(split+1) : target) }
     } else {
-      var commandLines = healthTarget.text.split("\n").filter(function(line) { return line.length > 0 })
-      common.command = { executable: commandLines.shift() || "", arguments: commandLines }
+      if (source && source.health && source.health.command && healthTarget.text === healthTargetFor(source.health)) common.command = clone(source.health.command)
+      else {
+        var commandLines = healthTarget.text.split("\n")
+        common.command = { executable: commandLines.shift() || "", arguments: commandLines }
+      }
     }
     return common
   }
@@ -94,20 +128,21 @@ Item {
       var split = line.lastIndexOf(":")
       return { serviceId: split > 0 ? line.substring(0, split).trim() : line.trim(), condition: split > 0 ? line.substring(split + 1).trim() : "started" }
     })
-    var args = argumentsField.text.split("\n").filter(function(line) { return line.length > 0 })
+    var originalArgs = source && source.command ? source.command.arguments || [] : []
+    var args = argumentsField.text === originalArgs.join("\n") ? clone(originalArgs) : (argumentsField.text === "" ? [] : argumentsField.text.split("\n"))
     var result = {
       name: nameField.text.trim(), description: descriptionField.text.trim(),
       command: { executable: executableField.text.trim(), arguments: args },
       workingDirectory: directoryField.text.trim(), environment: env, environmentFile: envFileField.text.trim(),
       autostart: autostartToggle.checked,
-      restart: { mode: restartMode.value, delaySeconds: restartDelay.value, maxAttempts: restartAttempts.value, resetAfterSeconds: 60 },
+      restart: { mode: restartMode.value, delaySeconds: restartDelay.value, maxAttempts: restartAttempts.value, resetAfterSeconds: source && source.restart ? numberOr(source.restart.resetAfterSeconds, 60) : 60 },
       stopSignal: stopSignal.value, gracefulStopSeconds: stopTimeout.value,
       dependencies: dependencies, url: urlField.text.trim(), notes: notesField.text,
       health: buildHealth()
     }
     if (root.editing) result.id = source.id
     if (shellToggle.checked) result.shell = { enabled: true, shell: shellPathField.text.trim() || "/bin/sh", command: shellCommandField.text }
-    if (dockerToggle.checked) result.docker = { composeFile: composeFileField.text.trim(), projectName: "", service: composeServiceField.text.trim() }
+    if (dockerToggle.checked) result.docker = { composeFile: composeFileField.text.trim(), projectName: source && source.docker ? String(source.docker.projectName || "") : "", service: composeServiceField.text.trim() }
     if (hostnameField.text.trim() !== "") result.route = { hostname: hostnameField.text.trim(), targetPort: routePort.value, https: false }
     return result
   }
@@ -150,6 +185,7 @@ Item {
   Rectangle {
     anchors.fill: parent
     color: Color.popups.background
+    MouseArea { anchors.fill: parent; onClicked: {} }
 
     Item {
       anchors.fill: parent
@@ -180,12 +216,14 @@ Item {
           iconText: "󰅖"
           tooltipText: "Cancel"
           focusable: true
-          onClicked: root.canceled()
+          enabled: !root.saving
+          onClicked: root.cancelEditor()
         }
       }
 
       Row {
         id: tabBar
+        enabled: !root.saving
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: header.bottom
@@ -222,17 +260,20 @@ Item {
 
       Layouts.StackLayout {
         id: pages
+        enabled: !root.saving
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: tabBar.bottom
-        anchors.bottom: footer.top
+        anchors.bottom: saveMessage.top
         anchors.topMargin: Style.space(8)
         anchors.bottomMargin: Style.space(8)
         currentIndex: root.page
 
-        Item {
+        Controls.ScrollView {
+          clip: true
+          contentWidth: availableWidth
           Column {
-            anchors.fill: parent
+            width: parent.width
             spacing: Style.space(7)
 
             Row {
@@ -450,13 +491,15 @@ Item {
           }
         }
 
-        Item {
+        Controls.ScrollView {
+          clip: true
+          contentWidth: availableWidth
           Column {
             id: lifecycleColumn
-            anchors.fill: parent
+            width: parent.width
             spacing: Style.space(7)
 
-            Toggle { id: autostartToggle; width: parent.width; label: "Autostart"; description: "Start when the OmaStack daemon starts."; onClicked: checked = !checked }
+            Toggle { id: autostartToggle; width: parent.width; label: "Autostart"; description: "Start once per user-manager session; daemon updates preserve stopped apps."; onClicked: checked = !checked }
 
             Row {
               id: restartRow
@@ -471,8 +514,8 @@ Item {
                 options: [{value:"never",label:"Never"},{value:"on-failure",label:"On failure"},{value:"always",label:"Always"}]
                 onChanged: function(nextValue) { restartMode.value = nextValue }
               }
-              NumberField { id: restartDelay; width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Delay (s)"; from: 0; to: 300; onModified: function(nextValue) { restartDelay.value = nextValue } }
-              NumberField { id: restartAttempts; width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Attempts · 0 ∞"; from: 0; to: 100; onModified: function(nextValue) { restartAttempts.value = nextValue } }
+              NumberField { id: restartDelay; width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Delay (s)"; from: 0; to: 3600; onModified: function(nextValue) { restartDelay.value = nextValue } }
+              NumberField { id: restartAttempts; width: (parent.width - parent.spacing * 2) / 3; fieldWidth: width; label: "Attempts · 0 ∞"; from: 0; to: 1000; onModified: function(nextValue) { restartAttempts.value = nextValue } }
             }
 
             Row {
@@ -489,7 +532,7 @@ Item {
 
             BorderSurface {
               width: parent.width
-              height: Math.max(Style.space(76), lifecycleColumn.height - autostartToggle.height - restartRow.height - stopRow.height - dependencyTitle.height - dependencyHint.height - lifecycleColumn.spacing * 5)
+              height: Style.space(150)
               color: Util.alpha(Color.foreground, 0.025)
               borderSpec: Border.flat(Util.alpha(Color.foreground, 0.14), Style.normalBorderWidth)
               radius: Style.cornerRadius
@@ -524,13 +567,15 @@ Item {
               }
             }
 
-            Text { textFormat: Text.PlainText; id: dependencyHint; width: parent.width; text: "Healthy waits for its check; shutdown runs in reverse order."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap }
+            Text { textFormat: Text.PlainText; id: dependencyHint; width: parent.width; text: "Healthy needs a health check. Stop affects only the selected services, in reverse dependency order."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap }
           }
         }
 
-        Item {
+        Controls.ScrollView {
+          clip: true
+          contentWidth: availableWidth
           Column {
-            anchors.fill: parent
+            width: parent.width
             spacing: Style.space(7)
 
             Row {
@@ -591,7 +636,7 @@ Item {
                 width: (parent.parent.width - parent.columnSpacing) / 2
                 spacing: Style.space(3)
                 Text { textFormat: Text.PlainText; width: parent.width; text: "TIMEOUT (S)"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption }
-                NumberField { id: healthTimeout; width: parent.width; fieldWidth: width; from: 1; to: 120; onModified: function(nextValue) { healthTimeout.value = nextValue } }
+                NumberField { id: healthTimeout; width: parent.width; fieldWidth: width; from: 1; to: 60; onModified: function(nextValue) { healthTimeout.value = nextValue } }
               }
               Column {
                 width: (parent.parent.width - parent.columnSpacing) / 2
@@ -649,9 +694,11 @@ Item {
           }
         }
 
-        Item {
+        Controls.ScrollView {
+          clip: true
+          contentWidth: availableWidth
           Column {
-            anchors.fill: parent
+            width: parent.width
             spacing: Style.space(8)
 
             TextField { id: urlField; width: parent.width; placeholderText: "Optional URL to open"; Accessible.name: "Service URL" }
@@ -695,6 +742,16 @@ Item {
         }
       }
 
+      Text { textFormat: Text.PlainText;
+        id: saveMessage
+        anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: footer.top
+        anchors.bottomMargin: Style.space(6)
+        text: root.saving ? "Saving…" : root.saveError
+        color: root.saveError !== "" ? Color.urgent : Color.muted
+        font.family: Style.font.family; font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
       Row {
         id: footer
         anchors.left: parent.left
@@ -703,7 +760,7 @@ Item {
         height: Math.max(cancelButton.implicitHeight, saveButton.implicitHeight)
         spacing: Style.space(7)
 
-        Button { id: cancelButton; text: "Cancel"; height: parent.height; focusable: true; onClicked: root.canceled() }
+        Button { id: cancelButton; text: "Cancel"; height: parent.height; focusable: true; enabled: !root.saving; onClicked: root.cancelEditor() }
         Item { width: Math.max(0, parent.width - cancelButton.width - saveButton.width - parent.spacing * 2); height: 1 }
         Button {
           id: saveButton
@@ -713,6 +770,7 @@ Item {
           height: parent.height
           active: true
           focusable: true
+          enabled: !root.saving
           onClicked: {
             if (nameField.text.trim() === "") { root.page = 0; nameField.forceActiveFocus(); return }
             if (!dockerToggle.checked && !shellToggle.checked && executableField.text.trim() === "") { root.page = 0; executableField.forceActiveFocus(); return }
@@ -722,5 +780,15 @@ Item {
         }
       }
     }
+  }
+
+  ConfirmDialog {
+    id: discardDialog
+    anchors.fill: parent
+    message: "Discard unsaved service changes?"
+    confirmText: "Discard"
+    onOpenedChanged: if (opened) root.forceActiveFocus()
+    onCanceled: opened = false
+    onConfirmed: { opened = false; root.canceled() }
   }
 }

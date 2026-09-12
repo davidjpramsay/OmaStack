@@ -59,8 +59,17 @@ func ShutdownOrder(services map[string]model.Service, targets []string) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	for left, right := 0, len(order)-1; left < right; left, right = left+1, right-1 {
-		order[left], order[right] = order[right], order[left]
+	// Startup expands prerequisites; shutdown must only affect the requested
+	// selection. In particular, restarting an app must not stop its shared DB.
+	selected := make(map[string]bool, len(targets))
+	for _, id := range targets {
+		selected[id] = true
 	}
-	return order, nil
+	result := make([]string, 0, len(selected))
+	for i := len(order) - 1; i >= 0; i-- {
+		if selected[order[i]] {
+			result = append(result, order[i])
+		}
+	}
+	return result, nil
 }
