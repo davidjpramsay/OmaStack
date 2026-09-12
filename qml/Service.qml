@@ -212,7 +212,8 @@ Item {
     if (!root._activeRequestSilent) root.actionStatus = "Working…"
     root._activeRequestMethod = request.method
     root._activeRequestToken = request.token
-    requestProcess.command = [root.binaryPath, "request", request.method, JSON.stringify(request.params)]
+    requestProcess.payload = JSON.stringify(request.params)
+    requestProcess.command = [root.binaryPath, "request", request.method, "-"]
     requestProcess.running = true
   }
 
@@ -271,10 +272,16 @@ Item {
     id: urgentRequestComponent
     Process {
       id: urgent
+      objectName: "omastackUrgentRequest"
       required property var requestData
       property string output: ""
       property string errors: ""
-      command: [root.binaryPath, "request", requestData.method, JSON.stringify(requestData.params)]
+      command: [root.binaryPath, "request", requestData.method, "-"]
+      stdinEnabled: true
+      onStarted: {
+        write(JSON.stringify(requestData.params) + "\n")
+        requestData.params = null
+      }
       stdout: StdioCollector { waitForEnd: true; onStreamFinished: urgent.output = text }
       stderr: StdioCollector { waitForEnd: true; onStreamFinished: urgent.errors = text }
       onExited: function(code) {
@@ -302,6 +309,12 @@ Item {
 
   Process {
     id: requestProcess
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: {
+      write(payload + "\n")
+      payload = ""
+    }
     running: false
     command: []
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root._stdout = text }

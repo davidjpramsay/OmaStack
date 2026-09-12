@@ -41,6 +41,15 @@ current release makes no privileged change and rejects HTTPS routes rather
 than presenting incomplete security as finished. See
 [Privileged operations](docs/privileged-operations.md).
 
+The proxy allows up to 16 concurrent requests per service and 64 overall.
+Upstream response headers have a 30-second deadline; upstream connections
+have a 60-second inactivity deadline, including upgraded WebSocket connections.
+Active streams remain supported; silent connections may need to reconnect.
+Secret-bearing UI requests travel over stdin, not process command arguments.
+CLI integrations can use `omastack request <method> -` with one compact JSON
+line on stdin (maximum 512 KiB); positional JSON remains available for
+non-sensitive requests. Oversized redacted messages are omitted entirely.
+
 ## Requirements
 
 OmaStack targets Omarchy Quattro on Arch Linux/Hyprland. Building requires Go

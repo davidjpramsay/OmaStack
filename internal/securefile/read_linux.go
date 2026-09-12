@@ -12,7 +12,8 @@ import (
 // ReadRegular opens the final path component with O_NOFOLLOW, verifies the
 // opened object rather than a pre-open pathname, and enforces a byte limit.
 func ReadRegular(path string, maxBytes int64, requirePrivate bool) ([]byte, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	// Reject FIFOs/devices after opening without waiting for a FIFO writer.
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}

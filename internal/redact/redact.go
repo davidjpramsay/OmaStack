@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"omastack/internal/bounded"
 	"omastack/internal/model"
 )
 
@@ -30,13 +31,29 @@ func Secrets(config model.Config) []string {
 }
 
 func Text(value string, secrets []string) string {
-	result := value
+	// Match only original input, never the masks emitted by earlier matches.
+	seen := make(map[string]bool)
+	patterns := make([]string, 0, len(secrets))
 	for _, secret := range secrets {
-		if secret != "" {
-			result = strings.ReplaceAll(result, secret, Mask)
+		if secret != "" && !seen[secret] {
+			seen[secret] = true
+			patterns = append(patterns, secret)
 		}
 	}
-	return result
+	if len(patterns) == 0 {
+		return value
+	}
+	sort.Slice(patterns, func(i, j int) bool { return len(patterns[i]) > len(patterns[j]) })
+	pairs := make([]string, 0, 2*len(patterns))
+	for _, pattern := range patterns {
+		pairs = append(pairs, pattern, Mask)
+	}
+	output := bounded.NewBuffer(1 << 20)
+	_, _ = strings.NewReplacer(pairs...).WriteString(output, value)
+	if output.Truncated {
+		return "[OmaStack: message omitted because redacted output exceeds 1 MiB]"
+	}
+	return output.String()
 }
 
 func Config(config model.Config) model.Config {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"omastack/internal/control"
 	"omastack/internal/paths"
 )
 
@@ -23,6 +24,27 @@ func setTestXDG(t *testing.T) paths.Paths {
 		t.Fatal(err)
 	}
 	return resolved
+}
+
+func TestRequestParamsPrivateStdin(t *testing.T) {
+	secret := `{"service":{"environment":{"TOKEN":{"value":"sentinel-秘密\nvalue","secret":true}}}}`
+	for _, input := range []string{secret, secret + "\n"} {
+		got, err := requestParams([]string{"service.update", "-"}, strings.NewReader(input))
+		if err != nil || string(got) != secret {
+			t.Fatalf("stdin round trip: %q %v", got, err)
+		}
+	}
+	for _, input := range []string{"", "{", secret + " junk\n", `"` + strings.Repeat("x", control.MaxMessageBytes/2) + `"`} {
+		if _, err := requestParams([]string{"service.update", "-"}, strings.NewReader(input)); err == nil {
+			t.Fatal("invalid/oversized stdin accepted")
+		}
+	}
+	for _, args := range [][]string{{"ping"}, {"ping", "{}"}} {
+		got, err := requestParams(args, strings.NewReader(""))
+		if err != nil || string(got) != "{}" {
+			t.Fatalf("legacy request: %q %v", got, err)
+		}
+	}
 }
 
 func TestRunInformationalAndArgumentValidation(t *testing.T) {

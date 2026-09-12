@@ -44,6 +44,32 @@ Rectangle {
       }
     }
 
+    function test_requestSecretsUseStdin() {
+      var backend = createTemporaryObject(backendComponent, stage, {manageIpc:false})
+      var secret = "sentinel-秘密\npassword"
+      backend.createService("project", {name:"test", environment:{TOKEN:{value:secret,secret:true}}})
+      var process = null
+      for (var i=0; i<backend.data.length; i++) {
+        var item = backend.data[i]
+        if (item.command && item.command[1] === "request") process = item
+      }
+      verify(process !== null)
+      compare(process.command[3], "-")
+      verify(JSON.stringify(process.command).indexOf("sentinel") === -1)
+      verify(process.stdinEnabled)
+      process.started()
+      compare(JSON.parse(process.written).service.environment.TOKEN.value, secret)
+      compare(process.payload, "")
+      backend.request("stop", {target:"fixture", secret:secret})
+      var urgent = findChild(backend, "omastackUrgentRequest")
+      verify(urgent !== null)
+      compare(urgent.command[3], "-")
+      verify(JSON.stringify(urgent.command).indexOf("sentinel") === -1)
+      urgent.started()
+      compare(JSON.parse(urgent.written).secret, secret)
+      compare(urgent.requestData.params, null)
+    }
+
     function test_routeShortcutIncludesProxyPort() {
       var service = stubService()
       service.snapshot.settings.proxy.enabled = true

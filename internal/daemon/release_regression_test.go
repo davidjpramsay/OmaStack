@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +19,42 @@ import (
 	"omastack/internal/model"
 	"omastack/internal/supervise"
 )
+
+func TestFIFOImportsReleaseOperationGate(t *testing.T) {
+	for _, method := range []string{"docker.import", "config.import"} {
+		t.Run(method, func(t *testing.T) {
+			d := testDaemon(t)
+			path := filepath.Join(t.TempDir(), "hostile-pipe")
+			if err := syscall.Mkfifo(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			params := rawParams(t, map[string]any{"composeFile": path})
+			if method == "config.import" {
+				params = rawParams(t, map[string]any{"path": path, "replace": true})
+			}
+			done := make(chan control.Response, 1)
+			go func() {
+				done <- d.handle(context.Background(), control.Request{ID: "fifo", Method: method, Params: params})
+			}()
+			select {
+			case response := <-done:
+				if response.OK || response.Error == nil || !strings.Contains(response.Error.Message, "not a regular file") {
+					t.Fatalf("unexpected rejection: %+v", response)
+				}
+			case <-time.After(time.Second):
+				fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+				if err == nil {
+					_ = syscall.Close(fd)
+				}
+				t.Fatal("import blocked")
+			}
+			response := d.handle(context.Background(), control.Request{ID: "after", Method: "settings.patch", Params: json.RawMessage(`{"logBufferLines":2000}`)})
+			if !response.OK {
+				t.Fatalf("operation gate not usable: %+v", response)
+			}
+		})
+	}
+}
 
 func writeFixture(t *testing.T, path, contents string, mode os.FileMode) {
 	t.Helper()

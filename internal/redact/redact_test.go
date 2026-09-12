@@ -23,3 +23,23 @@ func TestSecretRedaction(t *testing.T) {
 		t.Fatal("public value masked")
 	}
 }
+
+func TestTextDoesNotReprocessMasks(t *testing.T) {
+	secrets := []string{"•", "•", "•", "•", "•", "•", "•", "•", "•", "•", Mask, ""}
+	if got := Text("before • after", secrets); got != "before "+Mask+" after" {
+		t.Fatalf("mask amplification: %q", got)
+	}
+	if got := Text("token-long token", []string{"token", "token-long", "•"}); got != Mask+" "+Mask {
+		t.Fatalf("overlap: %q", got)
+	}
+	if got := Text("ordinary output", secrets); got != "ordinary output" {
+		t.Fatalf("ordinary text changed: %q", got)
+	}
+}
+
+func TestTextBoundsExpandedOutputWithoutPartialDisclosure(t *testing.T) {
+	got := Text(strings.Repeat("x", 100000)+"private-tail", []string{"x", "private-tail"})
+	if got != "[OmaStack: message omitted because redacted output exceeds 1 MiB]" {
+		t.Fatalf("expected complete omission, got %d bytes", len(got))
+	}
+}

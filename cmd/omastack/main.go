@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -298,21 +299,39 @@ func logsCommand(ctx context.Context, resolved paths.Paths, args []string) error
 }
 
 func requestCommand(ctx context.Context, resolved paths.Paths, args []string) error {
-	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: omastack request <method> [params-json]")
-	}
-	params := json.RawMessage("{}")
-	if len(args) == 2 {
-		params = json.RawMessage(args[1])
-		if !json.Valid(params) {
-			return errors.New("params-json is invalid")
-		}
+	params, err := requestParams(args, os.Stdin)
+	if err != nil {
+		return err
 	}
 	var result any
 	if err := clientForMethod(resolved, args[0]).Call(ctx, args[0], params, &result); err != nil {
 		return err
 	}
 	return printJSON(result)
+}
+
+func requestParams(args []string, input io.Reader) (json.RawMessage, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return nil, errors.New("usage: omastack request <method> [params-json|-] ('-' reads one JSON line from stdin)")
+	}
+	params := json.RawMessage("{}")
+	if len(args) == 2 {
+		params = json.RawMessage(args[1])
+		if args[1] == "-" {
+			line, err := bufio.NewReader(io.LimitReader(input, control.MaxMessageBytes/2+2)).ReadBytes('\n')
+			if err != nil && err != io.EOF {
+				return nil, errors.New("could not read request parameters from stdin")
+			}
+			params = json.RawMessage(strings.TrimSuffix(string(line), "\n"))
+		}
+	}
+	if len(params) > control.MaxMessageBytes/2 {
+		return nil, errors.New("params-json exceeds request size limit")
+	}
+	if !json.Valid(params) {
+		return nil, errors.New("params-json is invalid")
+	}
+	return params, nil
 }
 
 func printCall(ctx context.Context, resolved paths.Paths, method string, params any) error {

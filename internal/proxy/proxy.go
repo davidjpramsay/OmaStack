@@ -35,11 +35,51 @@ type Manager struct {
 	address   string
 	lastError string
 	requests  chan struct{}
+	active    map[string]int
+	transport *http.Transport
 	port      int
 }
 
 func New(resolve PortResolver) *Manager {
-	return &Manager{routes: map[string]routeTarget{}, resolve: resolve, requests: make(chan struct{}, 64)}
+	return &Manager{routes: map[string]routeTarget{}, resolve: resolve, requests: make(chan struct{}, 64),
+		active: map[string]int{}, transport: upstreamTransport(30*time.Second, 60*time.Second)}
+}
+
+// Refresh deadlines for each I/O, including upgraded connections. Active
+// streams can continue; stalled headers, bodies and websocket peers cannot
+// retain a route slot indefinitely. No environment proxy may redirect traffic.
+func upstreamTransport(headerTimeout, idleTimeout time.Duration) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.ResponseHeaderTimeout = headerTimeout
+	transport.MaxResponseHeaderBytes = 32 << 10
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &idleConn{Conn: conn, timeout: idleTimeout}, nil
+	}
+	return transport
+}
+
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	if err := c.Conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	if err := c.Conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(p)
 }
 
 func (m *Manager) Configure(settings model.ProxySettings, projects []model.Project) error {
@@ -105,13 +145,6 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 }
 
 func (m *Manager) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	select {
-	case m.requests <- struct{}{}:
-		defer func() { <-m.requests }()
-	default:
-		http.Error(writer, "OmaStack proxy is busy", http.StatusServiceUnavailable)
-		return
-	}
 	request.Body = http.MaxBytesReader(writer, request.Body, 64<<20)
 	host := request.Host
 	if parsedHost, _, err := net.SplitHostPort(request.Host); err == nil {
@@ -138,8 +171,35 @@ func (m *Manager) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "OmaStack target is not running", http.StatusBadGateway)
 		return
 	}
+	// Count by stable service ID, not hostname: reconfiguration must not reset
+	// in-flight admission or allow aliases to consume every global slot.
+	m.mu.Lock()
+	if m.active[target.serviceID] >= 16 {
+		m.mu.Unlock()
+		http.Error(writer, "OmaStack route is busy", http.StatusServiceUnavailable)
+		return
+	}
+	select {
+	case m.requests <- struct{}{}:
+		m.active[target.serviceID]++
+	default:
+		m.mu.Unlock()
+		http.Error(writer, "OmaStack proxy is busy", http.StatusServiceUnavailable)
+		return
+	}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.active[target.serviceID]--
+		if m.active[target.serviceID] == 0 {
+			delete(m.active, target.serviceID)
+		}
+		m.mu.Unlock()
+		<-m.requests
+	}()
 	upstream := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
+	reverse.Transport = m.transport
 	reverse.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "OmaStack upstream unavailable", http.StatusBadGateway)
 	}
@@ -190,6 +250,7 @@ func (m *Manager) Routes() []model.ActiveRoute {
 }
 
 func (m *Manager) Close() error {
+	m.transport.CloseIdleConnections()
 	m.mu.Lock()
 	server := m.server
 	m.server, m.listener, m.address = nil, nil, ""
