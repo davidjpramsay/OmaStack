@@ -3,6 +3,7 @@
 /dist/
 /coverage.out
 /.cache/
+/.codex/
 *.test
 *.prof
 *.tmp

@@ -85,6 +85,26 @@ func TestApplyDockerOutcomeUsesRunningHealth(t *testing.T) {
 	}
 }
 
+func TestDockerReconciliationDoesNotClaimOrphansAreManaged(t *testing.T) {
+	for _, tc := range []struct {
+		state         string
+		initial, want model.ServiceStatus
+		clean         bool
+	}{
+		{"created", model.StatusStopped, model.StatusStopped, true},
+		{"running", model.StatusStopped, model.StatusUnhealthy, true},
+		{"restarting", model.StatusStopped, model.StatusUnhealthy, true},
+		{"running", model.StatusCrashed, model.StatusCrashed, false},
+		{"created", model.StatusCrashed, model.StatusCrashed, false},
+	} {
+		runtime := model.ServiceRuntime{Status: tc.initial, LastError: "supervisor failed"}
+		applyDockerOutcome(&runtime, docker.ContainerState{State: tc.state}, tc.clean)
+		if runtime.Status != tc.want {
+			t.Fatalf("%s: status=%s want=%s", tc.state, runtime.Status, tc.want)
+		}
+	}
+}
+
 func TestProjectDeletionIgnoresDependenciesInsideRemovedProject(t *testing.T) {
 	config := model.DefaultConfig()
 	config.Projects = []model.Project{
@@ -255,7 +275,7 @@ func TestConfigurationMutationWorkflow(t *testing.T) {
 
 	updated := *storedService
 	updated.Name = "API renamed"
-	updated.Environment = map[string]model.EnvValue{"TOKEN": {Value: redact.Mask, Secret: true}}
+	updated.Environment = map[string]model.EnvValue{"TOKEN": {KeepFrom: "TOKEN", Secret: true}}
 	if _, err := instance.updateService(rawParams(t, servicePayload{Service: updated})); err != nil {
 		t.Fatal(err)
 	}

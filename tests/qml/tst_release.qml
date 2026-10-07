@@ -13,6 +13,7 @@ Rectangle {
   Component { id: logsComponent; AppComponents.LogsView {} }
   Component { id: serviceRowComponent; AppComponents.CompactServiceRow {} }
   Component { id: serviceEditorComponent; AppComponents.ServiceEditor {} }
+  Component { id: projectEditorComponent; AppComponents.ProjectEditor {} }
   Component { id: panelComponent; App.CompactPanel {} }
   Component { id: backendComponent; App.Service {} }
   Component { id: connectionComponent; App.BackendConnection {} }
@@ -42,6 +43,53 @@ Rectangle {
           notifications:{crashed:true, unhealthy:true, recovered:true}, proxy:{enabled:false, listenHost:"127.0.0.1", httpPort:8088}}, routes:[], diagnostics:[]},
         setPanelVisible:function(value) {}, refresh:function() {}, updateSettings:function(value) {}
       }
+    }
+
+    function test_projectDraftContainsOnlyMetadata() {
+      var editor = createTemporaryObject(projectEditorComponent, stage, {width:380,height:620})
+      editor.begin({id:"project", name:"Original", order:4, services:[{id:"running", environment:{TOKEN:{value:"mask",secret:true}}}]})
+      var draft = editor.draft()
+      compare(draft.id, "project")
+      compare(draft.name, "Original")
+      compare(draft.services, undefined)
+      compare(draft.order, undefined)
+    }
+
+    function test_secretIntentSurvivesToggleRenameAndExplicitMask() {
+      var editor = createTemporaryObject(serviceEditorComponent, stage, {width:380,height:620})
+      editor.begin("project", {id:"api",name:"API",workingDirectory:"/tmp",command:{executable:"/usr/bin/true"}, environment:{TOKEN:{value:"••••••••",secret:true,keepFrom:"TOKEN"}}})
+      editor.page = 1
+      wait(50)
+      verify(findChildWhere(editor, function(item) { return item.placeholderText === "Stored value kept · type to replace" }) !== null)
+      var rows = findChild(editor, "serviceEnvironmentRows")
+      verify(rows !== null)
+      compare(rows.get(0).valueText, "")
+      rows.setProperty(0, "secretValue", false)
+      rows.setProperty(0, "keyText", "RENAMED")
+      var result = editor.buildService().environment.RENAMED
+      compare(result.secret, false)
+      compare(result.keepFrom, "TOKEN")
+      compare(result.value, "")
+      rows.setProperty(0, "keepFrom", "")
+      rows.setProperty(0, "valueText", "••••••••")
+      result = editor.buildService().environment.RENAMED
+      compare(result.keepFrom, undefined)
+      compare(result.value, "••••••••")
+    }
+
+    function test_disconnectedBackendHasSelectableManualSetup() {
+      var service = stubService()
+      service.connected = false
+      service.projects = [{id:"project",name:"Saved project",services:[]}]
+      var panel = createTemporaryObject(panelComponent, stage, {width:380,height:500,service:service})
+      var notice = findChild(panel, "backendSetupNotice")
+      verify(notice !== null && notice.visible)
+      notice.clicked()
+      compare(panel.section, "settings")
+      var instructions = findChild(panel, "backendSetupCommands")
+      verify(instructions !== null && instructions.visible && instructions.readOnly && instructions.selectByMouse)
+      compare(instructions.textFormat, TextEdit.PlainText)
+      verify(instructions.text.indexOf("./bin/omastack setup") >= 0)
     }
 
     function test_requestSecretsUseStdin() {

@@ -44,7 +44,7 @@ Item {
   readonly property bool editorOpen: projectWizard.opened || projectEditor.opened || serviceEditor.opened || deleteDialog.opened || importDialog.opened
   readonly property int stackListHeight: estimatedStackListHeight()
   readonly property int preferredWidth: 380
-  readonly property real stackChromeHeight: stackHero.implicitHeight + counts.height + searchField.implicitHeight + stackSeparatorTop.height + stackSeparatorBottom.height + stackFooter.height + stackColumn.spacing*6
+  readonly property real stackChromeHeight: stackHero.implicitHeight + counts.height + searchField.implicitHeight + stackSeparatorTop.height + stackSeparatorBottom.height + stackFooter.height + stackColumn.spacing*6 + (backendNotice.visible ? backendNotice.implicitHeight + stackColumn.spacing : 0)
   readonly property real preferredHeight: editorOpen
     ? Style.space(620)
     : (section === "stack" ? stackChromeHeight + Style.space(stackListHeight)
@@ -348,6 +348,18 @@ Item {
             }
           }
 
+          Button {
+            id: backendNotice
+            objectName: "backendSetupNotice"
+            visible: !root.connected
+            width: parent.width
+            text: "Backend offline · setup / recovery instructions"
+            iconText: "󰋗"
+            bordered: true
+            focusable: true
+            onClicked: root.section = "settings"
+          }
+
           Row {
             id: counts
             width: parent.width
@@ -644,6 +656,35 @@ Item {
               id: settingsColumn
               width: settingsScroll.availableWidth; spacing: Style.space(10)
               Text { textFormat: Text.PlainText; visible: Boolean(root.service && root.service.settingsPending); text: "Saving settings…"; color: root.secondaryText; font.family: Style.font.family; font.pixelSize: Style.font.caption }
+              Column {
+                objectName: "backendSetupInstructions"
+                visible: !root.connected
+                width: parent.width
+                spacing: Style.space(6)
+                PanelSectionHeader { text: "BACKEND SETUP / RECOVERY" }
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: "Plugin Install updates the panel only. Build and install the backend once, and again after plugin updates. Review the source first; these commands run only when you enter them in a terminal. Requires Go and systemd."
+                  wrapMode: Text.WordWrap
+                  color: root.secondaryText
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                TextEdit {
+                  objectName: "backendSetupCommands"
+                  width: parent.width
+                  readOnly: true
+                  selectByMouse: true
+                  textFormat: TextEdit.PlainText
+                  text: "cd ~/.config/omarchy/plugins/david.omastack\n./scripts/build.sh\n./bin/omastack setup\n\n# If already installed:\nsystemctl --user restart omastackd.service"
+                  wrapMode: TextEdit.Wrap
+                  color: Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                PanelSeparator { width: parent.width }
+              }
               PanelSectionHeader { text: "APPEARANCE" }
               CompactToggleRow {
                 width: parent.width

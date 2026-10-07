@@ -97,9 +97,11 @@ func runOnce(ctx context.Context, resolved paths.Paths, service model.Service, r
 	if err != nil {
 		return 126, "", err
 	}
-	cmd := exec.Command(command, args...)
-	cmd.Dir = service.WorkingDirectory
-	cmd.Env = environment
+	// runOnce owns cancellation and signal forwarding for the process group.
+	cmd, err := (Execution{Environment: environment, Directory: service.WorkingDirectory}).Command(context.Background(), command, args...)
+	if err != nil {
+		return 127, "", err
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Own the read ends: exec.Cmd.Wait must not close them before the log
 	// readers have drained the child's final output.

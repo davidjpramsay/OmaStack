@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -15,7 +16,10 @@ import (
 	"time"
 
 	"omastack/internal/bounded"
+	"omastack/internal/model"
 	"omastack/internal/securefile"
+	"omastack/internal/supervise"
+	"omastack/internal/validate"
 )
 
 type Availability struct {
@@ -61,6 +65,13 @@ type composePS struct {
 	} `json:"Publishers"`
 }
 
+func execution(options []supervise.Execution) supervise.Execution {
+	if len(options) > 0 {
+		return options[0]
+	}
+	return supervise.Execution{}
+}
+
 func Detect(ctx context.Context) Availability {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return Availability{}
@@ -75,11 +86,12 @@ func Detect(ctx context.Context) Availability {
 	}
 	composeCtx, composeCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer composeCancel()
-	result.ComposeAvailable = exec.CommandContext(composeCtx, "docker", "compose", "version").Run() == nil
+	_, err := runCombined(composeCtx, 1<<20, "docker", "compose", "version")
+	result.ComposeAvailable = err == nil
 	return result
 }
 
-func ImportCompose(ctx context.Context, composeFile string) ([]ImportedService, error) {
+func ImportCompose(ctx context.Context, composeFile string, options ...supervise.Execution) ([]ImportedService, error) {
 	if !filepath.IsAbs(composeFile) || filepath.Clean(composeFile) != composeFile {
 		return nil, errors.New("compose path must be absolute and normalized")
 	}
@@ -93,8 +105,12 @@ func ImportCompose(ctx context.Context, composeFile string) ([]ImportedService, 
 	// validation and Compose opening it. Non-interpolation prevents project
 	// environment values from appearing in the discovery result. Setting the
 	// working directory preserves relative-path semantics for the input file.
-	cmd := exec.CommandContext(callCtx, "docker", composeConfigArguments()...)
-	cmd.Dir = filepath.Dir(composeFile)
+	policy := execution(options)
+	policy.Directory = filepath.Dir(composeFile)
+	cmd, err := policy.Command(callCtx, "docker", composeConfigArguments()...)
+	if err != nil {
+		return nil, err
+	}
 	cmd.Stdin = bytes.NewReader(composeData)
 	output := bounded.NewBuffer(16 << 20)
 	stderr := bounded.NewBuffer(64 << 10)
@@ -153,15 +169,15 @@ func composeConfigArguments() []string {
 	return []string{"compose", "-f", "-", "config", "--no-interpolate", "--format", "json"}
 }
 
-func Inspect(ctx context.Context, composeFile, projectName, service string) (ContainerState, error) {
-	return inspect(ctx, composeFile, projectName, service, true)
+func Inspect(ctx context.Context, composeFile, projectName, service string, options ...supervise.Execution) (ContainerState, error) {
+	return inspect(ctx, composeFile, projectName, service, true, execution(options))
 }
 
-func InspectHealth(ctx context.Context, composeFile, projectName, service string) (ContainerState, error) {
-	return inspect(ctx, composeFile, projectName, service, false)
+func InspectHealth(ctx context.Context, composeFile, projectName, service string, options ...supervise.Execution) (ContainerState, error) {
+	return inspect(ctx, composeFile, projectName, service, false, execution(options))
 }
 
-func inspect(ctx context.Context, composeFile, projectName, service string, stats bool) (ContainerState, error) {
+func inspect(ctx context.Context, composeFile, projectName, service string, stats bool, policy supervise.Execution) (ContainerState, error) {
 	args := []string{"compose", "-f", composeFile}
 	if projectName != "" {
 		args = append(args, "--project-name", projectName)
@@ -169,7 +185,7 @@ func inspect(ctx context.Context, composeFile, projectName, service string, stat
 	args = append(args, "ps", "--all", "--format", "json", service)
 	callCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	output, err := runCombined(callCtx, 8<<20, "docker", args...)
+	output, err := runWithPolicy(callCtx, policy, 8<<20, "docker", args...)
 	if err != nil {
 		return ContainerState{}, fmt.Errorf("docker compose ps: %s", concise(output, err))
 	}
@@ -185,7 +201,7 @@ func inspect(ctx context.Context, composeFile, projectName, service string, stat
 	// Compose's process can outlive several container replacements/restarts.
 	// Read actual container state so readiness is tied to this container run.
 	if result.ID != "" {
-		output, err := runCombined(callCtx, 64<<10, "docker", "inspect", "--format", "{{json .State}}", result.ID)
+		output, err := runWithPolicy(callCtx, policy, 64<<10, "docker", "inspect", "--format", "{{json .State}}", result.ID)
 		if err != nil {
 			return ContainerState{}, fmt.Errorf("docker inspect: %s", concise(output, err))
 		}
@@ -212,13 +228,13 @@ func inspect(ctx context.Context, composeFile, projectName, service string, stat
 		result.Published = result.Published[:256]
 	}
 	if stats && result.ID != "" && result.State == "running" {
-		result.CPU, result.MemoryMB, _ = inspectStats(callCtx, result.ID)
+		result.CPU, result.MemoryMB, _ = inspectStats(callCtx, result.ID, policy)
 	}
 	return result, nil
 }
 
-func inspectStats(ctx context.Context, containerID string) (float64, float64, error) {
-	output, err := runCombined(ctx, 1<<20, "docker", "stats", "--no-stream", "--format", "{{json .}}", containerID)
+func inspectStats(ctx context.Context, containerID string, policy supervise.Execution) (float64, float64, error) {
+	output, err := runWithPolicy(ctx, policy, 1<<20, "docker", "stats", "--no-stream", "--format", "{{json .}}", containerID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("docker stats: %s", concise(output, err))
 	}
@@ -280,31 +296,53 @@ func decodePS(output []byte) ([]composePS, error) {
 	return records, scanner.Err()
 }
 
-func OpenTerminal(ctx context.Context, composeFile, projectName, service string) error {
-	args := []string{"docker", "compose", "-f", composeFile}
-	if projectName != "" {
-		args = append(args, "--project-name", projectName)
+func OpenTerminal(ctx context.Context, binary, serviceID, configFile string) error {
+	if !filepath.IsAbs(binary) || !filepath.IsAbs(configFile) || !validate.ID(serviceID) {
+		return errors.New("invalid Docker terminal command")
 	}
-	args = append(args, "exec", service, "/bin/sh")
+	// Terminal/session brokers can restore the complete user-manager environment.
+	// Resolve service policy inside the terminal, without credentials in argv.
+	args := []string{binary, "docker-shell", serviceID, configFile}
 	launcher := "xdg-terminal-exec"
 	launcherArgs := args
 	if _, err := exec.LookPath("uwsm-app"); err == nil {
 		launcher, launcherArgs = "uwsm-app", append([]string{"--", "xdg-terminal-exec"}, args...)
 	}
-	command := exec.CommandContext(ctx, launcher, launcherArgs...)
+	command, err := (supervise.Execution{}).Command(ctx, launcher, launcherArgs...)
+	if err != nil {
+		return err
+	}
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("open Docker terminal: %w", err)
 	}
 	return command.Process.Release()
 }
 
-func Action(ctx context.Context, composeFile, projectName, service, action string) error {
+func RunShell(ctx context.Context, service model.Service) error {
+	if service.Docker == nil {
+		return errors.New("docker service not found")
+	}
+	policy, err := supervise.ForService(service)
+	if err != nil {
+		return err
+	}
+	args := append(composeArguments(service.Docker), "exec", service.Docker.Service, "/bin/sh")
+	command, err := policy.Command(ctx, "docker", args...)
+	if err != nil {
+		return err
+	}
+	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return command.Run()
+}
+
+func Action(ctx context.Context, composeFile, projectName, service, action string, options ...supervise.Execution) error {
 	allowed := map[string][]string{
-		"start":    {"up", "--detach", "--no-build", "--no-deps"},
-		"stop":     {"stop"},
-		"restart":  {"restart", "--no-deps"},
-		"rebuild":  {"build"},
-		"recreate": {"up", "--detach", "--force-recreate", "--no-deps"},
+		"start":   {"up", "--detach", "--no-build", "--no-deps"},
+		"stop":    {"stop"},
+		"restart": {"restart", "--no-deps"},
+		"rebuild": {"build"},
+		// --no-start and --no-deps preserve stopped state and separate ownership.
+		"recreate": {"up", "--no-start", "--no-build", "--force-recreate", "--no-deps"},
 	}
 	verb, ok := allowed[action]
 	if !ok {
@@ -318,7 +356,7 @@ func Action(ctx context.Context, composeFile, projectName, service, action strin
 	args = append(args, service)
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	output, err := runCombined(callCtx, 2<<20, "docker", args...)
+	output, err := runWithPolicy(callCtx, execution(options), 2<<20, "docker", args...)
 	if err != nil {
 		return fmt.Errorf("docker compose %s: %s", action, concise(output, err))
 	}
@@ -341,9 +379,16 @@ func concise(output []byte, err error) string {
 }
 
 func runCombined(ctx context.Context, limit int, executable string, args ...string) ([]byte, error) {
+	return runWithPolicy(ctx, supervise.Execution{}, limit, executable, args...)
+}
+
+func runWithPolicy(ctx context.Context, policy supervise.Execution, limit int, executable string, args ...string) ([]byte, error) {
 	output := bounded.NewBuffer(limit)
-	command := exec.CommandContext(ctx, executable, args...)
+	command, err := policy.Command(ctx, executable, args...)
+	if err != nil {
+		return nil, err
+	}
 	command.Stdout, command.Stderr = output, output
-	err := command.Run()
+	err = command.Run()
 	return append([]byte{}, output.Bytes()...), err
 }

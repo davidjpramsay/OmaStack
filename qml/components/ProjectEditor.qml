@@ -14,7 +14,7 @@ FocusScope {
   signal saved(var projectData)
 
   function draft() {
-    var copy = source ? JSON.parse(JSON.stringify(source)) : {}
+    var copy = source ? { id: source.id } : {}
     copy.name = nameField.text.trim(); copy.description = descriptionField.text.trim(); copy.icon = iconField.text.trim(); copy.color = colorField.text.trim()
     return copy
   }

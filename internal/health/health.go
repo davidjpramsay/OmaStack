@@ -8,12 +8,12 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os/exec"
 	"regexp"
 	"sync"
 	"time"
 
 	"omastack/internal/model"
+	"omastack/internal/supervise"
 )
 
 type State struct {
@@ -59,7 +59,7 @@ func NewChecker(maxConcurrent int) *Checker {
 	return &Checker{semaphore: make(chan struct{}, maxConcurrent)}
 }
 
-func (c *Checker) Check(ctx context.Context, check model.HealthCheck) error {
+func (c *Checker) Check(ctx context.Context, check model.HealthCheck, options ...supervise.Execution) error {
 	// Queueing is part of the probe's budget, not an unbounded prelude to it.
 	callCtx, cancel := context.WithTimeout(ctx, time.Duration(check.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -75,7 +75,7 @@ func (c *Checker) Check(ctx context.Context, check model.HealthCheck) error {
 	case "tcp":
 		return checkTCP(callCtx, check.TCP)
 	case "command":
-		return checkCommand(callCtx, check.Command)
+		return checkCommand(callCtx, check.Command, options...)
 	default:
 		return errors.New("unsupported health-check type")
 	}
@@ -136,11 +136,18 @@ func checkTCP(ctx context.Context, spec *model.TCPCheck) error {
 	return err
 }
 
-func checkCommand(ctx context.Context, spec *model.CommandSpec) error {
+func checkCommand(ctx context.Context, spec *model.CommandSpec, options ...supervise.Execution) error {
 	if spec == nil {
 		return errors.New("missing command check")
 	}
-	cmd := exec.CommandContext(ctx, spec.Executable, spec.Arguments...)
+	policy := supervise.Execution{}
+	if len(options) > 0 {
+		policy = options[0]
+	}
+	cmd, err := policy.Command(ctx, spec.Executable, spec.Arguments...)
+	if err != nil {
+		return err
+	}
 	if err := cmd.Run(); err != nil {
 		// Command output is unclassified and can contain secrets from project
 		// tooling. Report only the bounded process result.

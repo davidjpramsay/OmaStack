@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"omastack/internal/model"
+	"omastack/internal/supervise"
 )
 
 func TestComposeDiscoveryUsesStdinWithoutInterpolation(t *testing.T) {
@@ -47,17 +50,18 @@ case "$*" in
 esac
 `
 	dockerPath := filepath.Join(directory, "docker")
+	script = strings.ReplaceAll(script, "$OMASTACK_DOCKER_TEST_LOG", logPath)
 	if err := os.WriteFile(dockerPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	launcher := `#!/bin/sh
 printf '%s\n' "$*" >> "$OMASTACK_DOCKER_TEST_LOG"
 `
+	launcher = strings.ReplaceAll(launcher, "$OMASTACK_DOCKER_TEST_LOG", logPath)
 	if err := os.WriteFile(filepath.Join(directory, "uwsm-app"), []byte(launcher), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("OMASTACK_DOCKER_TEST_LOG", logPath)
 	return directory, logPath
 }
 
@@ -89,7 +93,7 @@ func TestDockerCommandWorkflows(t *testing.T) {
 	if err := Action(ctx, composePath, "stack", "api", "delete"); err == nil {
 		t.Fatal("unsupported action accepted")
 	}
-	if err := OpenTerminal(ctx, composePath, "stack", "api"); err != nil {
+	if err := OpenTerminal(ctx, "/tmp/fixture-omastack", "11111111-1111-4111-8111-111111111111", "/tmp/fixture-config.json"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,12 +101,12 @@ func TestDockerCommandWorkflows(t *testing.T) {
 	var calls []byte
 	for time.Now().Before(deadline) {
 		calls, _ = os.ReadFile(logPath)
-		if strings.Contains(string(calls), "xdg-terminal-exec docker compose") {
+		if strings.Contains(string(calls), "xdg-terminal-exec /tmp/fixture-omastack docker-shell") {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for _, expected := range []string{"config --no-interpolate", "--project-name stack ps --all", "stats --no-stream", "up --detach --no-build --no-deps api", "restart --no-deps api", "build api", "--force-recreate --no-deps api", "xdg-terminal-exec docker compose"} {
+	for _, expected := range []string{"config --no-interpolate", "--project-name stack ps --all", "stats --no-stream", "up --detach --no-build --no-deps api", "restart --no-deps api", "build api", "up --no-start --no-build --force-recreate --no-deps api", "xdg-terminal-exec /tmp/fixture-omastack docker-shell"} {
 		if !strings.Contains(string(calls), expected) {
 			t.Errorf("missing %q in calls:\n%s", expected, calls)
 		}
@@ -140,6 +144,67 @@ func TestParseDockerMemory(t *testing.T) {
 		got, err := parseMemoryMB(input)
 		if err != nil || got != want {
 			t.Errorf("%s = %v, %v; want %v", input, got, err, want)
+		}
+	}
+}
+
+func TestServiceSubprocessPathsShareEnvironmentDirectoryAndPATH(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "policy.log")
+	script := `#!/bin/sh
+[ -z "$AWS_SECRET_ACCESS_KEY" ] || exit 91
+[ "$EXPLICIT" = "configured" ] && [ "$FILE_VALUE" = "from-file" ] || exit 92
+[ "$PWD" = "FIXTURE_DIR" ] || exit 93
+printf '%s\n' "$*" >> "FIXTURE_DIR/policy.log"
+case "$*" in
+ *" config --no-interpolate --format json") /usr/bin/cat >/dev/null; printf '{"services":{"api":{}}}' ;;
+ *" ps --all --format json "*) printf '[{"ID":"fixture","State":"running"}]' ;;
+ "inspect --format {{json .State}} fixture") printf '{"Status":"exited","ExitCode":0}' ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(strings.ReplaceAll(script, "FIXTURE_DIR", dir)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	compose := filepath.Join(dir, "compose.yaml")
+	if err := os.WriteFile(compose, []byte("services: {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(dir, "environment")
+	if err := os.WriteFile(envFile, []byte("FILE_VALUE=from-file\nPATH="+dir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "synthetic-ambient-credential")
+	s := model.Service{WorkingDirectory: dir, EnvironmentFile: envFile, Environment: map[string]model.EnvValue{"EXPLICIT": {Value: "configured"}}, Docker: &model.DockerSpec{ComposeFile: compose, ProjectName: "fixture", Service: "api"}, GracefulStopSeconds: 1}
+	policy, err := supervise.ForService(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := ImportCompose(ctx, compose, policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Inspect(ctx, compose, "fixture", "api", policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectHealth(ctx, compose, "fixture", "api", policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := Action(ctx, compose, "fixture", "api", "recreate", policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopService(ctx, s, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunShell(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"config --no-interpolate", "ps --all", "inspect --format", "up --no-start", "stop --timeout 0", "exec api /bin/sh"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("missing %s in %s", want, data)
 		}
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"omastack/internal/redact"
 	"omastack/internal/securefile"
 	"omastack/internal/store"
+	"omastack/internal/supervise"
 	"omastack/internal/validate"
 )
 
@@ -124,7 +127,7 @@ func (d *Daemon) handle(ctx context.Context, request control.Request) control.Re
 	case "service.create":
 		result, err = d.createService(request.Params)
 	case "service.update":
-		result, err = d.updateService(request.Params)
+		result, err = d.updateService(request.Params, ctx)
 	case "service.delete":
 		result, err = d.deleteService(ctx, request.Params)
 	case "docker.status":
@@ -245,9 +248,7 @@ func (d *Daemon) performAction(ctx context.Context, action, target string) error
 				return errors.Join(append(failures, ctx.Err())...)
 			}
 			d.healthStates.Reset(id)
-			manager := d.systemd
-			manager.Timeout = time.Duration(services[id].GracefulStopSeconds+10) * time.Second
-			if err := manager.Stop(ctx, id); err != nil {
+			if err := d.stopService(ctx, services[id], false); err != nil {
 				failures = append(failures, err)
 			}
 		}
@@ -258,16 +259,57 @@ func (d *Daemon) performAction(ctx context.Context, action, target string) error
 		}
 		return d.performAction(ctx, "start", target)
 	case "kill":
-		for _, id := range ids {
+		order, err := deps.ShutdownOrder(services, ids)
+		if err != nil {
+			return err
+		}
+		var failures []error
+		for _, id := range order {
 			d.healthStates.Reset(id)
-			if err := d.systemd.ForceKill(ctx, id); err != nil {
-				return err
+			if err := d.stopService(ctx, services[id], true); err != nil {
+				failures = append(failures, err)
 			}
 		}
+		return errors.Join(failures...)
 	default:
 		return errors.New("unsupported lifecycle action")
 	}
-	return nil
+}
+
+func (d *Daemon) stopService(ctx context.Context, service model.Service, force bool) error {
+	if service.Docker != nil {
+		defer d.dockerChanged(service.ID)
+	}
+	manager := d.systemd
+	manager.Timeout = time.Duration(service.GracefulStopSeconds+10) * time.Second
+	var failures []error
+	if force {
+		unit, err := manager.Show(ctx, service.ID)
+		if err != nil {
+			failures = append(failures, err)
+		} else if unit.MainPID != 0 || unit.ActiveState == "active" || unit.ActiveState == "activating" {
+			if err := manager.ForceKill(ctx, service.ID); err != nil {
+				failures = append(failures, err)
+			}
+		}
+	}
+	// Stop even after SIGKILL so a supervisor cannot restart the container.
+	if err := manager.Stop(ctx, service.ID); err != nil {
+		failures = append(failures, err)
+	}
+	if service.Docker != nil {
+		// Docker daemon-owned containers are not members of this unit's cgroup.
+		if err := docker.StopService(ctx, service, force); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if force && len(failures) == 0 {
+		// This was a successful explicit kill, not an unattended unit failure.
+		if err := manager.ResetFailed(ctx, service.ID); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func resolveTargets(config model.Config, target string) ([]string, error) {
@@ -436,11 +478,13 @@ func (d *Daemon) updateProject(raw json.RawMessage) (any, error) {
 	err := d.store.Update(func(config *model.Config) error {
 		for index := range config.Projects {
 			if config.Projects[index].ID == params.Project.ID {
-				if len(params.Project.Services) == 0 {
-					params.Project.Services = config.Projects[index].Services
-				}
-				mergeMaskedProjectSecrets(&params.Project, config.Projects[index])
-				config.Projects[index] = params.Project
+				// Metadata only: stale UI snapshots cannot replace definitions or
+				// bypass dedicated service operations and lifecycle checks.
+				project := &config.Projects[index]
+				project.Name = params.Project.Name
+				project.Description = params.Project.Description
+				project.Icon = params.Project.Icon
+				project.Color = params.Project.Color
 				return nil
 			}
 		}
@@ -607,7 +651,7 @@ func (d *Daemon) createService(raw json.RawMessage) (any, error) {
 	return map[string]string{"status": "created", "id": params.Service.ID}, err
 }
 
-func (d *Daemon) updateService(raw json.RawMessage) (any, error) {
+func (d *Daemon) updateService(raw json.RawMessage, contexts ...context.Context) (any, error) {
 	var params servicePayload
 	if err := decodeParams(raw, &params); err != nil {
 		return nil, err
@@ -615,11 +659,40 @@ func (d *Daemon) updateService(raw json.RawMessage) (any, error) {
 	if !validate.ID(params.Service.ID) {
 		return nil, errors.New("invalid service id")
 	}
+	_, previous, ok := d.store.Get().FindService(params.Service.ID)
+	if !ok {
+		return nil, errors.New("service not found")
+	}
+	proposed := params.Service
+	proposed.Environment = maps.Clone(proposed.Environment)
+	if err := mergeMaskedSecrets(&proposed, *previous); err != nil {
+		return nil, err
+	}
+	if err := validate.Service(&proposed); err != nil {
+		return nil, err
+	}
+	if (previous.Docker != nil || proposed.Docker != nil) && dockerExecutionChanged(*previous, proposed) {
+		ctx := context.Background()
+		if len(contexts) > 0 {
+			ctx = contexts[0]
+		}
+		// Retain the old execution identity until all of its containers stop.
+		if err := d.ensureStopped(ctx, previous.ID); err != nil {
+			return nil, fmt.Errorf("stop the Docker service before changing its execution settings: %w", err)
+		}
+		if proposed.Docker != nil {
+			if err := docker.EnsureStopped(ctx, proposed); err != nil {
+				return nil, err
+			}
+		}
+	}
 	err := d.store.Update(func(config *model.Config) error {
 		for pi := range config.Projects {
 			for si := range config.Projects[pi].Services {
 				if config.Projects[pi].Services[si].ID == params.Service.ID {
-					mergeMaskedSecrets(&params.Service, config.Projects[pi].Services[si])
+					if err := mergeMaskedSecrets(&params.Service, config.Projects[pi].Services[si]); err != nil {
+						return err
+					}
 					config.Projects[pi].Services[si] = params.Service
 					return nil
 				}
@@ -628,6 +701,17 @@ func (d *Daemon) updateService(raw json.RawMessage) (any, error) {
 		return errors.New("service not found")
 	})
 	return map[string]string{"status": "saved", "id": params.Service.ID}, err
+}
+
+func dockerExecutionChanged(previous, proposed model.Service) bool {
+	values := func(environment map[string]model.EnvValue) map[string]string {
+		result := make(map[string]string, len(environment))
+		for key, value := range environment {
+			result[key] = value.Value
+		}
+		return result
+	}
+	return !reflect.DeepEqual(previous.Docker, proposed.Docker) || previous.WorkingDirectory != proposed.WorkingDirectory || previous.EnvironmentFile != proposed.EnvironmentFile || !maps.Equal(values(previous.Environment), values(proposed.Environment))
 }
 
 func (d *Daemon) deleteService(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -674,6 +758,13 @@ func (d *Daemon) ensureStopped(ctx context.Context, serviceID string) error {
 	}
 	if unit.ActiveState != "inactive" && unit.ActiveState != "failed" {
 		return fmt.Errorf("cannot verify service is stopped: unexpected systemd state %q", unit.ActiveState)
+	}
+	_, service, ok := d.store.Get().FindService(serviceID)
+	if !ok {
+		return errors.New("service not found")
+	}
+	if service.Docker != nil {
+		return docker.EnsureStopped(ctx, *service)
 	}
 	return nil
 }
@@ -742,26 +833,19 @@ func normalizeService(service *model.Service) {
 	}
 }
 
-func mergeMaskedProjectSecrets(next *model.Project, previous model.Project) {
-	old := map[string]model.Service{}
-	for _, service := range previous.Services {
-		old[service.ID] = service
-	}
-	for index := range next.Services {
-		if prior, ok := old[next.Services[index].ID]; ok {
-			mergeMaskedSecrets(&next.Services[index], prior)
-		}
-	}
-}
-
-func mergeMaskedSecrets(next *model.Service, previous model.Service) {
+func mergeMaskedSecrets(next *model.Service, previous model.Service) error {
 	for name, value := range next.Environment {
-		if value.Secret && value.Value == redact.Mask {
-			if old, ok := previous.Environment[name]; ok && old.Secret {
-				next.Environment[name] = old
-			}
+		if value.KeepFrom == "" {
+			continue
 		}
+		old, ok := previous.Environment[value.KeepFrom]
+		if !ok || !old.Secret || value.Value != "" {
+			return fmt.Errorf("stored secret reference for %q is invalid; re-enter its value", name)
+		}
+		value.Value, value.KeepFrom = old.Value, ""
+		next.Environment[name] = value
 	}
+	return nil
 }
 
 func (d *Daemon) importCompose(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -782,7 +866,36 @@ func (d *Daemon) dockerAction(ctx context.Context, raw json.RawMessage) (any, er
 		return nil, errors.New("docker service not found")
 	}
 	d.healthStates.Reset(service.ID)
-	err := docker.Action(ctx, service.Docker.ComposeFile, service.Docker.ProjectName, service.Docker.Service, params.Action)
+	if params.Action == "start" || params.Action == "stop" || params.Action == "restart" || params.Action == "kill" {
+		return map[string]string{"status": "ok"}, d.performAction(ctx, params.Action, service.ID)
+	}
+	policy, err := supervise.ForService(*service)
+	if err != nil {
+		return nil, err
+	}
+	wasRunning := false
+	if params.Action == "recreate" {
+		unit, err := d.systemd.Show(ctx, service.ID)
+		if err != nil {
+			return nil, err
+		}
+		if unit.ActiveState == "activating" || unit.ActiveState == "deactivating" || unit.ActiveState == "reloading" {
+			return nil, errors.New("wait for the service transition before recreating it")
+		}
+		wasRunning = unit.ActiveState == "active" && unit.MainPID > 0
+		if wasRunning {
+			if err := d.performAction(ctx, "stop", service.ID); err != nil {
+				return nil, err
+			}
+		} else if err := d.ensureStopped(ctx, service.ID); err != nil {
+			return nil, err
+		}
+	}
+	err = docker.Action(ctx, service.Docker.ComposeFile, service.Docker.ProjectName, service.Docker.Service, params.Action, policy)
+	d.dockerChanged(service.ID)
+	if err == nil && wasRunning {
+		err = d.performAction(ctx, "start", service.ID)
+	}
 	return map[string]string{"status": "ok"}, err
 }
 
@@ -795,7 +908,14 @@ func (d *Daemon) dockerTerminal(ctx context.Context, raw json.RawMessage) (any, 
 	if !ok || service.Docker == nil {
 		return nil, errors.New("docker service not found")
 	}
-	if err := docker.OpenTerminal(ctx, service.Docker.ComposeFile, service.Docker.ProjectName, service.Docker.Service); err != nil {
+	if _, err := supervise.ForService(*service); err != nil {
+		return nil, err
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	if err := docker.OpenTerminal(ctx, binary, service.ID, d.paths.ConfigFile); err != nil {
 		return nil, err
 	}
 	return map[string]string{"status": "opened"}, nil

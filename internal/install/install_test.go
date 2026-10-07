@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"omastack/internal/model"
 	"omastack/internal/paths"
+	"omastack/internal/store"
 )
 
 func TestSecureDirectoryRejectsWritableExistingDirectory(t *testing.T) {
@@ -151,8 +153,47 @@ func TestSetupAndUninstallLifecycle(t *testing.T) {
 		}
 	}
 	const serviceID = "12345678-1234-4234-8234-123456789abc"
+	config, err := store.OpenConfig(resolved.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Update(func(c *model.Config) error {
+		c.Projects = []model.Project{{ID: "11111111-1111-4111-8111-111111111111", Name: "Fixture", Services: []model.Service{{ID: serviceID, Name: "Docker", WorkingDirectory: home, GracefulStopSeconds: 1, StopSignal: "SIGTERM", Restart: model.RestartPolicy{Mode: "never"}, Docker: &model.DockerSpec{ComposeFile: filepath.Join(home, "compose.yaml"), ProjectName: "fixture", Service: "api"}}}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dockerScript := `#!/bin/sh
+[ ! -f "FIXTURE_HOME/fail-docker" ] || exit 1
+printf '%s\n' "$*" >> "FIXTURE_HOME/docker.log"
+case "$*" in
+ *" ps --all --format json "*) printf '[{"ID":"fixture","State":"exited"}]' ;;
+ "inspect --format {{json .State}} fixture") printf '{"Status":"exited"}' ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(helperDir, "docker"), []byte(strings.ReplaceAll(dockerScript, "FIXTURE_HOME", home)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "fail-docker"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Uninstall(context.Background(), resolved, []string{serviceID}, true); err == nil {
+		t.Fatal("uninstall discarded control files despite Docker shutdown failure")
+	}
+	for _, path := range []string{result.Binary, result.DaemonUnit, result.ServiceUnit} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed uninstall removed %s: %v", path, err)
+		}
+	}
+	if err := os.Remove(filepath.Join(home, "fail-docker")); err != nil {
+		t.Fatal(err)
+	}
 	if err := Uninstall(context.Background(), resolved, []string{serviceID}, true); err != nil {
 		t.Fatal(err)
+	}
+	dockerCalls, err := os.ReadFile(filepath.Join(home, "docker.log"))
+	if err != nil || !strings.Contains(string(dockerCalls), "stop --timeout 1 api") || !strings.Contains(string(dockerCalls), "ps --all --format json api") {
+		t.Fatalf("Docker uninstall calls=%s err=%v", dockerCalls, err)
 	}
 	for _, path := range []string{result.Binary, result.DaemonUnit, result.ServiceUnit, resolved.SocketFile, resolved.SnapshotFile} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {

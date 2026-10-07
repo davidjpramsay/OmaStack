@@ -1,0 +1,58 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go: ['1.25.13', '1.27.0']
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false # standard-library-only module
+      - run: go test -race -count=1 -cover ./...
+      - run: go vet ./...
+      - name: Static release build
+        run: CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o "$RUNNER_TEMP/omastack" ./cmd/omastack
+      - name: Shell syntax
+        run: for script in scripts/*.sh; do bash -n "$script"; done
+      - run: shellcheck scripts/*.sh
+
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.27.0'
+          cache: false
+      - name: Install pinned analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - run: staticcheck ./...
+      - run: govulncheck ./...
+      - name: Scan release binary
+        run: |
+          CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o "$RUNNER_TEMP/omastack" ./cmd/omastack
+          govulncheck -mode=binary "$RUNNER_TEMP/omastack"
+      - run: gitleaks git --redact --no-banner .
+      - run: gitleaks dir --redact --no-banner qml
+
+  # Native QML and Omarchy validation are mandatory local release gates; see
+  # docs/testing.md. Ubuntu runners do not contain the installed Omarchy shell.

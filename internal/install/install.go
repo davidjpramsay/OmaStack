@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"omastack/internal/bounded"
+	"omastack/internal/docker"
 	"omastack/internal/paths"
 	"omastack/internal/securefile"
 	"omastack/internal/store"
@@ -100,6 +101,11 @@ func Setup(ctx context.Context, resolved paths.Paths) (Result, error) {
 }
 
 func Uninstall(ctx context.Context, resolved paths.Paths, serviceIDs []string, removeBinary bool) error {
+	configStore, err := store.OpenConfig(resolved.ConfigFile)
+	if err != nil {
+		return fmt.Errorf("read configuration before uninstall: %w", err)
+	}
+	services := configStore.Get().AllServices()
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -119,6 +125,11 @@ func Uninstall(ctx context.Context, resolved paths.Paths, serviceIDs []string, r
 	for _, id := range serviceIDs {
 		if err := manager.Stop(ctx, id); err != nil {
 			return fmt.Errorf("stop managed service %s: %w", id, err)
+		}
+		if service, ok := services[id]; ok && service.Docker != nil {
+			if err := docker.StopService(ctx, service, false); err != nil {
+				return fmt.Errorf("stop managed Docker service %s: %w", id, err)
+			}
 		}
 	}
 	for _, name := range []string{"omastackd.service", "omastack-service@.service"} {

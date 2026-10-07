@@ -4,11 +4,14 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"omastack/internal/model"
+	"omastack/internal/supervise"
 )
 
 func TestProbeTimeoutIncludesSemaphoreQueue(t *testing.T) {
@@ -87,6 +90,30 @@ func TestCommandHealthDoesNotSurfaceOutput(t *testing.T) {
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestCommandProbeUsesServiceEnvironmentDirectoryAndPATH(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "fake-ambient-credential")
+	if err := os.WriteFile(filepath.Join(dir, "probe"), []byte("#!/bin/sh\ntest -z \"$AWS_SECRET_ACCESS_KEY\" && test \"$EXPLICIT\" = configured && test -f marker\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "marker"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := model.Service{WorkingDirectory: dir, Environment: map[string]model.EnvValue{"PATH": {Value: dir}, "EXPLICIT": {Value: "configured"}}}
+	policy, err := supervise.ForService(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := model.HealthCheck{Type: "command", TimeoutSeconds: 2, Command: &model.CommandSpec{Executable: "probe"}}
+	if err := NewChecker(1).Check(context.Background(), check, policy); err != nil {
+		t.Fatal(err)
+	}
+	defaultProbe := model.CommandSpec{Executable: "/bin/sh", Arguments: []string{"-c", "test -z \"$AWS_SECRET_ACCESS_KEY\""}}
+	if err := checkCommand(context.Background(), &defaultProbe); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)

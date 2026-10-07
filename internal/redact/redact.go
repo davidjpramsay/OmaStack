@@ -65,6 +65,7 @@ func Config(config model.Config) model.Config {
 			for name, value := range result.Projects[pi].Services[si].Environment {
 				if value.Secret {
 					value.Value = Mask
+					value.KeepFrom = name
 					result.Projects[pi].Services[si].Environment[name] = value
 				}
 			}

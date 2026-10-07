@@ -18,7 +18,7 @@ FocusScope {
   signal canceled()
   signal saved(string projectId, var serviceData, bool editing)
 
-  ListModel { id: environmentRows }
+  ListModel { id: environmentRows; objectName: "serviceEnvironmentRows" }
 
   function clone(value) { return JSON.parse(JSON.stringify(value)) }
   function numberOr(value, fallback) { return value === undefined || value === null ? fallback : Number(value) }
@@ -53,7 +53,7 @@ FocusScope {
     shellCommandField.text = serviceData && serviceData.shell ? String(serviceData.shell.command || "") : ""
     shellPathField.text = serviceData && serviceData.shell ? String(serviceData.shell.shell || "/bin/sh") : "/bin/sh"
     var environment = serviceData && serviceData.environment ? serviceData.environment : {}
-    for (var key in environment) environmentRows.append({ keyText: key, valueText: String(environment[key].value || ""), secretValue: environment[key].secret === true })
+    for (var key in environment) environmentRows.append({ keyText: key, valueText: environment[key].keepFrom ? "" : String(environment[key].value || ""), secretValue: environment[key].secret === true, keepFrom: String(environment[key].keepFrom || "") })
     autostartToggle.checked = Boolean(serviceData && serviceData.autostart)
     restartMode.value = serviceData && serviceData.restart ? String(serviceData.restart.mode || "never") : "never"
     restartDelay.value = serviceData && serviceData.restart ? numberOr(serviceData.restart.delaySeconds, 1) : 1
@@ -121,7 +121,11 @@ FocusScope {
     var env = {}
     for (var index = 0; index < environmentRows.count; index++) {
       var row = environmentRows.get(index)
-      if (String(row.keyText || "").trim() !== "") env[String(row.keyText).trim()] = { value: row.valueText, secret: row.secretValue === true }
+      if (String(row.keyText || "").trim() !== "") {
+        var value = { value: row.keepFrom ? "" : row.valueText, secret: row.secretValue === true }
+        if (row.keepFrom) value.keepFrom = row.keepFrom
+        env[String(row.keyText).trim()] = value
+      }
     }
     var dependencyLines = dependencyField.text.split("\n").filter(function(line) { return line.trim().length > 0 })
     var dependencies = dependencyLines.map(function(line) {
@@ -410,7 +414,7 @@ FocusScope {
               text: "Add variable"
               iconText: "󰐕"
               focusable: true
-              onClicked: environmentRows.append({ keyText: "", valueText: "", secretValue: false })
+              onClicked: environmentRows.append({ keyText: "", valueText: "", secretValue: false, keepFrom: "" })
             }
             Item { width: parent.width - addVariableButton.width - secretHint.width; height: 1 }
             Text { textFormat: Text.PlainText; id: secretHint; width: Style.space(150); anchors.verticalCenter: parent.verticalCenter; text: "Secrets masked · mode 0600"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.caption; horizontalAlignment: Text.AlignRight; elide: Text.ElideRight }
@@ -442,6 +446,7 @@ FocusScope {
                 required property string keyText
                 required property string valueText
                 required property bool secretValue
+                required property string keepFrom
                 width: environmentList.width
                 height: Style.space(34)
                 spacing: Style.space(4)
@@ -460,9 +465,9 @@ FocusScope {
                   height: parent.height
                   text: valueText
                   password: secretValue
-                  placeholderText: secretValue && valueText === "••••••••" ? "Stored secret" : "Value"
+                  placeholderText: keepFrom ? "Stored value kept · type to replace" : "Value"
                   verticalPadding: Style.space(3)
-                  onTextEdited: environmentRows.setProperty(index, "valueText", text)
+                  onTextEdited: { environmentRows.setProperty(index, "keepFrom", ""); environmentRows.setProperty(index, "valueText", text) }
                   Accessible.name: "Environment variable value"
                 }
                 Button {
@@ -471,7 +476,7 @@ FocusScope {
                   height: parent.height
                   iconText: secretValue ? "󰈈" : "󰈉"
                   selected: secretValue
-                  tooltipText: secretValue ? "Secret value; click for plain" : "Plain value; click to mark secret"
+                  tooltipText: secretValue ? "Stop marking as secret (value kept)" : "Mark as secret (value kept)"
                   focusable: true
                   onClicked: environmentRows.setProperty(index, "secretValue", !secretValue)
                 }

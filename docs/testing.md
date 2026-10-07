@@ -1,8 +1,54 @@
 # Verification record
 
 Latest source/security-fix verification:
-[2026-09-12](security-fix-verification-2026-09-12.md), including a real isolated
-Docker/systemd shutdown regression. Historical results below retain their dates.
+[2026-10-07](security-fix-verification-2026-10-07.md), including the seven October
+audit fixes and real isolated Docker/systemd lifecycle acceptance. Historical
+results below retain their dates.
+
+Latest local install/profile acceptance:
+[2026-10-07](release-acceptance-2026-10-07.md). Native profile/backend and existing
+widget checks are covered; a separate clean desktop's library add/update/remove
+acceptance is still pending and must be disclosed to reviewers.
+
+## Current release gates
+
+Run `bash scripts/check-release.sh` on an Omarchy desktop with Go, Staticcheck
+v0.8.1, govulncheck v1.8.0, Gitleaks v8.30.1, ShellCheck, Qt Quick Test, jq and
+ripgrep available. The script fails if a required tool or native QML gate is
+missing. Security-analysis tools currently require Go 1.26 or newer; the
+application itself is also tested on its Go 1.25.13 minimum.
+
+The pinned GitHub workflow runs Go/race/vet/build and security checks on pushes
+and pull requests with read-only permissions. It does not pretend an Ubuntu
+runner has the installed Omarchy QML modules. Native QML/plugin validation,
+clean-account installation/update/removal, and live widget connection are
+mandatory acceptance checks before final release sign-off. An earlier review
+request must identify any outstanding gate and must not claim final sign-off.
+
+The native Docker lifecycle regression is opt-in because it creates a temporary
+runtime user unit and container. It uses the cached `alpine:3.22` image by its
+local SHA-256 ID, forbids pulls, exposes no ports, and removes only its uniquely
+named fixtures. It does not replace the installed daemon or service template:
+
+```bash
+OMASTACK_NATIVE_ACCEPTANCE=1 go test -count=1 -run '^TestNativeDockerLifecycleAcceptance$' -v ./internal/daemon
+```
+
+It checks stopped/running Recreate, managed start, Stop All, Force kill, orphan
+deletion refusal, stopped reconciliation and non-purge Docker shutdown. Uninstall
+uses a temporary HOME without a daemon unit, keeping the real daemon untouched.
+Do not enable this test for ordinary CI or on machines without a user manager.
+
+`bash scripts/capture-preview.sh` regenerates root `preview.png` from the real
+panel with clearly synthetic sample services. The separate capture fixture is
+not part of the ordinary QML suite and does not read user configuration. The
+preview has a 2x native render and padded background, rather than an upscaled
+screenshot. Inspect it after visual changes.
+
+Final packaging uses committed files only and refuses a dirty checkout. Before
+publishing, review the exact release SHA, run secret/history scans, verify
+public repository access, and complete the marketplace's exact-commit review.
+Local test success is not marketplace approval or a promise of zero bugs.
 
 Latest native integration acceptance: [2026-09-12](native-acceptance-2026-09-12.md).
 The records below describe earlier verification, not a substitute for checking

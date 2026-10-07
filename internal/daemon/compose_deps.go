@@ -8,6 +8,7 @@ import (
 
 	"omastack/internal/docker"
 	"omastack/internal/model"
+	"omastack/internal/supervise"
 )
 
 // Compose dependencies get separate managed supervisors. Never let one
@@ -34,7 +35,11 @@ func managedComposeGraph(ctx context.Context, services map[string]model.Service,
 		if spec := service.Docker; spec != nil {
 			entries, ok := models[spec.ComposeFile]
 			if !ok {
-				imported, err := docker.ImportCompose(ctx, spec.ComposeFile)
+				policy, err := supervise.ForService(service)
+				if err != nil {
+					return err
+				}
+				imported, err := docker.ImportCompose(ctx, spec.ComposeFile, policy)
 				if err != nil {
 					return err
 				}
@@ -97,8 +102,12 @@ func waitDockerCondition(ctx context.Context, service model.Service, condition s
 		return fmt.Errorf("docker dependency has no Compose configuration")
 	}
 	spec := service.Docker
+	policy, err := supervise.ForService(service)
+	if err != nil {
+		return err
+	}
 	for {
-		state, err := docker.InspectHealth(ctx, spec.ComposeFile, spec.ProjectName, spec.Service)
+		state, err := docker.InspectHealth(ctx, spec.ComposeFile, spec.ProjectName, spec.Service, policy)
 		if err != nil {
 			return err
 		}

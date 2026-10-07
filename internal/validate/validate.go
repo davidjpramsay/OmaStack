@@ -176,6 +176,9 @@ func Service(s *model.Service) error {
 		return errors.New("too many environment variables")
 	}
 	for name, value := range s.Environment {
+		if value.KeepFrom != "" {
+			return errors.New("stored secret references are only allowed in service updates")
+		}
 		if !envNamePattern.MatchString(name) {
 			return fmt.Errorf("invalid environment variable name %q", name)
 		}

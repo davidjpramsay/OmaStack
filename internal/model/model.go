@@ -76,6 +76,8 @@ type ShellSpec struct {
 type EnvValue struct {
 	Value  string `json:"value"`
 	Secret bool   `json:"secret,omitempty"`
+	// KeepFrom is request/snapshot metadata, never persisted configuration.
+	KeepFrom string `json:"keepFrom,omitempty"`
 }
 
 type Dependency struct {

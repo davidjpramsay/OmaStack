@@ -80,14 +80,16 @@ func installComposeFixture(t *testing.T, dir string) string {
 	writeFixture(t, path, "services: {}\n", 0o600)
 	t.Setenv("OMASTACK_COMPOSE_MODEL", filepath.Join(dir, "model.json"))
 	t.Setenv("OMASTACK_CONTAINER_STATE", filepath.Join(dir, "container.json"))
-	writeFixture(t, filepath.Join(dir, "docker"), `#!/bin/sh
+	script := `#!/bin/sh
 case "$*" in
   *" config --no-interpolate --format json") /usr/bin/cat >/dev/null; /usr/bin/cat "$OMASTACK_COMPOSE_MODEL" ;;
   *" ps --all --format json "*) printf '%s\n' '[{"ID":"container-1","State":"running"}]' ;;
   "inspect --format {{json .State}} container-1") /usr/bin/cat "$OMASTACK_CONTAINER_STATE" ;;
   *) exit 77 ;;
 esac
-`, 0o700)
+`
+	script = strings.NewReplacer("$OMASTACK_COMPOSE_MODEL", os.Getenv("OMASTACK_COMPOSE_MODEL"), "$OMASTACK_CONTAINER_STATE", os.Getenv("OMASTACK_CONTAINER_STATE")).Replace(script)
+	writeFixture(t, filepath.Join(dir, "docker"), script, 0o700)
 	writeFixture(t, os.Getenv("OMASTACK_CONTAINER_STATE"), `{"Status":"running","StartedAt":"2026-09-08T00:00:00Z","Health":{"Status":"healthy"}}`, 0o600)
 	return path
 }
@@ -203,6 +205,10 @@ while [ ! -f "$OMASTACK_PROBE_RELEASE" ]; do /usr/bin/sleep 0.01; done
 				s.Health.Command.Executable = probe
 				s.Health.TimeoutSeconds = 3
 				s.Health.IntervalSeconds = 3
+				s.Environment = map[string]model.EnvValue{
+					"OMASTACK_PROBE_CALLS":   {Value: os.Getenv("OMASTACK_PROBE_CALLS")},
+					"OMASTACK_PROBE_RELEASE": {Value: os.Getenv("OMASTACK_PROBE_RELEASE")},
+				}
 				if containerRestart {
 					s.Docker = &model.DockerSpec{ComposeFile: compose, Service: "db"}
 				}

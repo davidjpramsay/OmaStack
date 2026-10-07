@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -27,17 +28,20 @@ type routeTarget struct {
 }
 
 type Manager struct {
-	mu        sync.RWMutex
-	server    *http.Server
-	listener  net.Listener
-	routes    map[string]routeTarget
-	resolve   PortResolver
-	address   string
-	lastError string
-	requests  chan struct{}
-	active    map[string]int
-	transport *http.Transport
-	port      int
+	lifecycle   sync.Mutex
+	mu          sync.RWMutex
+	server      *http.Server
+	listener    net.Listener
+	routes      map[string]routeTarget
+	resolve     PortResolver
+	address     string
+	lastError   string
+	requests    chan struct{}
+	active      map[string]int
+	transport   *http.Transport
+	port        int
+	connections *connectionSet
+	cancel      context.CancelFunc
 }
 
 func New(resolve PortResolver) *Manager {
@@ -83,6 +87,8 @@ func (c *idleConn) Write(p []byte) (int, error) {
 }
 
 func (m *Manager) Configure(settings model.ProxySettings, projects []model.Project) error {
+	m.lifecycle.Lock()
+	defer m.lifecycle.Unlock()
 	routes := map[string]routeTarget{}
 	for _, project := range projects {
 		for _, service := range project.Services {
@@ -100,27 +106,41 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 		}
 	}
 	m.mu.Lock()
+	routesChanged := !maps.Equal(m.routes, routes)
 	m.routes = routes
 	m.port = settings.HTTPPort
 	m.mu.Unlock()
 	if !settings.Enabled {
-		return m.Close()
+		return m.close()
 	}
 	address := net.JoinHostPort(settings.ListenHost, strconv.Itoa(settings.HTTPPort))
 	m.mu.RLock()
 	same := m.listener != nil && m.address == address
 	m.mu.RUnlock()
-	if same {
+	if same && !routesChanged {
 		return nil
 	}
-	_ = m.Close()
+	_ = m.close()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		m.setError(err.Error())
 		return fmt.Errorf("reverse proxy listen %s: %w", address, err)
 	}
+	connections := newConnectionSet()
+	transport := upstreamTransport(30*time.Second, 60*time.Second)
+	dial := transport.DialContext
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return connections.track(conn)
+	}
+	listener = &trackedListener{Listener: listener, connections: connections}
+	serverCtx, cancel := context.WithCancel(context.Background())
 	server := &http.Server{
-		Handler:           m,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { m.serveHTTP(w, r, transport) }),
+		BaseContext:       func(net.Listener) context.Context { return serverCtx },
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      5 * time.Minute,
@@ -130,6 +150,7 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 	}
 	m.mu.Lock()
 	m.listener, m.server, m.address, m.lastError = listener, server, address, ""
+	m.transport, m.connections, m.cancel = transport, connections, cancel
 	m.mu.Unlock()
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -145,6 +166,13 @@ func (m *Manager) Configure(settings model.ProxySettings, projects []model.Proje
 }
 
 func (m *Manager) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	m.mu.RLock()
+	transport := m.transport
+	m.mu.RUnlock()
+	m.serveHTTP(writer, request, transport)
+}
+
+func (m *Manager) serveHTTP(writer http.ResponseWriter, request *http.Request, transport *http.Transport) {
 	request.Body = http.MaxBytesReader(writer, request.Body, 64<<20)
 	host := request.Host
 	if parsedHost, _, err := net.SplitHostPort(request.Host); err == nil {
@@ -199,7 +227,7 @@ func (m *Manager) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}()
 	upstream := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
-	reverse.Transport = m.transport
+	reverse.Transport = transport
 	reverse.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "OmaStack upstream unavailable", http.StatusBadGateway)
 	}
@@ -250,17 +278,30 @@ func (m *Manager) Routes() []model.ActiveRoute {
 }
 
 func (m *Manager) Close() error {
-	m.transport.CloseIdleConnections()
+	m.lifecycle.Lock()
+	defer m.lifecycle.Unlock()
+	return m.close()
+}
+
+func (m *Manager) close() error {
 	m.mu.Lock()
 	server := m.server
+	connections, cancel, transport := m.connections, m.cancel, m.transport
 	m.server, m.listener, m.address = nil, nil, ""
+	m.connections, m.cancel = nil, nil
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if connections != nil {
+		connections.closeAll()
+	}
+	transport.CloseIdleConnections()
 	if server == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	return server.Shutdown(ctx)
+	// Close ordinary connections too; Shutdown can time out leaving them open.
+	return server.Close()
 }
 
 func (m *Manager) LastError() string     { m.mu.RLock(); defer m.mu.RUnlock(); return m.lastError }

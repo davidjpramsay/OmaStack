@@ -12,8 +12,8 @@ trap 'rm -rf -- "$test_dir"' EXIT
 ln -s "$shell_dir" "$test_dir/qs"
 ln -s "$project_dir/tests/qml/stubs/Quickshell" "$test_dir/Quickshell"
 QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME='' QT_QUICK_BACKEND=software \
-  "$runner" -input "$project_dir/tests/qml" -import "$test_dir" "$@" | tee "$test_dir/output.log"
+  "$runner" -input "${OMASTACK_QML_TEST_DIR:-$project_dir/tests/qml}" -import "$test_dir" "$@" | tee "$test_dir/output.log"
 # Some runner builds return zero despite reporting a failing QML test.
-if rg -q '^(FAIL!|QFATAL)|Totals:.*[1-9][0-9]* failed' "$test_dir/output.log"; then
+if rg -q '^(FAIL!|QFATAL)|Totals:.*[1-9][0-9]* failed|ReferenceError:|TypeError:|Binding loop detected|Unable to assign' "$test_dir/output.log"; then
   exit 1
 fi

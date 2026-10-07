@@ -22,14 +22,16 @@ import (
 	"omastack/internal/control"
 	"omastack/internal/daemon"
 	"omastack/internal/deps"
+	"omastack/internal/docker"
 	"omastack/internal/install"
 	"omastack/internal/model"
 	"omastack/internal/paths"
 	"omastack/internal/store"
 	"omastack/internal/supervise"
+	"omastack/internal/validate"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -63,6 +65,21 @@ func run(args []string) error {
 			return errors.New("usage: omastack supervise <service-id>")
 		}
 		return supervise.Run(ctx, resolved, args[1])
+	case "docker-shell":
+		if len(args) != 3 || !validate.ID(args[1]) || !filepath.IsAbs(args[2]) {
+			return errors.New("usage: omastack docker-shell <service-id> <absolute-config-path>")
+		}
+		// A terminal broker may restore different XDG settings. Bind the helper
+		// to the daemon's exact private config, never secret-bearing argv.
+		config, err := store.OpenConfig(args[2])
+		if err != nil {
+			return err
+		}
+		_, service, ok := config.Get().FindService(args[1])
+		if !ok {
+			return errors.New("docker service not found")
+		}
+		return docker.RunShell(ctx, *service)
 	case "list":
 		return showStatus(ctx, resolved, false, args[1:])
 	case "status":

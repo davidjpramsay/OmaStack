@@ -82,11 +82,15 @@ bash scripts/check-live.sh
 This check must show the same projects as the backend. A healthy
 `omastack status` alone does not verify the panel connection.
 
-For a published repository install, copy its HTTPS or SSH Git URL and use:
+For a published repository install:
+
+**Manual backend setup is required.** The plugin-library Install action installs
+the QML panel, not the backend executable or user units. Review the source, then
+run the build/setup commands below. The disconnected panel also provides these
+instructions; it never downloads or executes an installer automatically.
 
 ```bash
-read -rp "OmaStack Git URL: " omastack_repository
-omarchy plugin add "$omastack_repository" --enable
+omarchy plugin add https://github.com/davidjpramsay/OmaStack.git --enable
 cd "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/david.omastack"
 ./scripts/build.sh
 ./bin/omastack setup
@@ -94,6 +98,11 @@ cd "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/david.omastack"
 
 User projects live under `~/.config/omastack/`, outside the plugin checkout, so
 `omarchy plugin update david.omastack` cannot overwrite them.
+
+After a plugin update, rebuild and run `./bin/omastack setup` again from its
+checkout so the panel and backend stay in sync. If an already-installed backend
+is offline, try `systemctl --user restart omastackd.service` and check
+`journalctl --user -u omastackd.service -n 50` for errors.
 
 ## Everyday use
 
@@ -112,6 +121,13 @@ only the selected service, not shared prerequisites. Native Compose dependencies
 must be registered in OmaStack with the same Compose file and project name;
 each runs under its own supervisor. Missing required dependencies produce an
 error before startup, rather than launching unmanaged containers.
+
+Docker Recreate preserves stopped state. For a running service it performs a
+managed stop, recreates without starting dependencies, and starts through the
+usual dependency/readiness checks. Stop and Force kill explicitly stop
+Docker-owned containers, including containers left behind without a supervisor.
+Stop a Docker service before changing its Compose identity, working directory
+or environment. Metadata-only edits remain available while it is running.
 
 The bar shows four small counts—running, stopped, unhealthy and crashed—next to
 the icon by default. Open the panel's gear menu and switch off **Appearance →

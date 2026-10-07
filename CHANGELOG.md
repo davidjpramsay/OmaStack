@@ -3,7 +3,24 @@
 All notable changes to OmaStack are recorded here. The project follows
 Semantic Versioning.
 
-## [Unreleased]
+## [0.1.2] - 2026-10-07
+
+- Made project updates metadata-only so stale snapshots cannot discard services.
+- Kept stopped Docker Recreate stopped and running Recreate under managed
+  dependency/readiness orchestration; Stop/Force kill/uninstall explicitly stop
+  Docker-owned containers, and deletion/import/execution edits fail closed.
+- Shared filtered environment, working-directory and PATH resolution across
+  supervised commands, Docker helpers and command health probes. Terminal
+  helpers reload the exact private configuration without secrets in argv.
+- Preserved unchanged secret values across classification changes and renames
+  using explicit keep references instead of interpreting a mask as a value.
+- Revoked active proxy streams and upgraded tunnels on disable, route changes,
+  listener changes and shutdown.
+- Added Docker/systemd native acceptance, permanent audit regressions, pinned
+  CI security gates, manual backend onboarding and a reproducible root preview.
+- Recorded post-fix verification on 2026-10-07 separately from the original audit.
+- Kept orphan-container warnings and Docker inspection errors visible between
+  polls, without letting invalidated pre-stop caches undo intentional shutdown.
 
 - Fixed empty panels under replacement bars whose scoped shell cannot return
   OmaStack's shared service; the widget now owns a client when needed.

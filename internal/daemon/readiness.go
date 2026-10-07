@@ -55,7 +55,11 @@ func (d *Daemon) currentRunState(ctx context.Context, id string) (model.Service,
 	key, started := runIdentity(*service, unit, record), record.StartedAt
 	if key != "" && service.Docker != nil {
 		spec := service.Docker
-		container, err = docker.InspectHealth(ctx, spec.ComposeFile, spec.ProjectName, spec.Service)
+		policy, policyErr := supervise.ForService(*service)
+		if policyErr != nil {
+			return *service, "", nil, container, policyErr
+		}
+		container, err = docker.InspectHealth(ctx, spec.ComposeFile, spec.ProjectName, spec.Service, policy)
 		if err != nil {
 			return *service, "", nil, container, err
 		}
@@ -101,6 +105,9 @@ func (d *Daemon) startServices(ctx context.Context, services map[string]model.Se
 		if err := d.systemd.Start(ctx, id); err != nil {
 			return err
 		}
+		if services[id].Docker != nil {
+			d.dockerChanged(id)
+		}
 	}
 	return nil
 }
@@ -144,7 +151,11 @@ func (d *Daemon) waitHealthy(ctx context.Context, id string, timeout time.Durati
 			check := *service.Health
 			if time.Since(*started) >= time.Duration(check.StartGraceSeconds)*time.Second {
 				_, generation := d.healthStates.Observe(id, key)
-				checkErr := d.healthChecker.Check(ctx, check)
+				policy, policyErr := supervise.ForService(service)
+				if policyErr != nil {
+					return policyErr
+				}
+				checkErr := d.healthChecker.Check(ctx, check, policy)
 				_, after, _, err := d.currentRun(ctx, id)
 				if err != nil {
 					return err

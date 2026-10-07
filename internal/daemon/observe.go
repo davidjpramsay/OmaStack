@@ -7,15 +7,25 @@ import (
 
 	"omastack/internal/docker"
 	"omastack/internal/model"
+	"omastack/internal/supervise"
 	"omastack/internal/systemd"
 )
 
 type observation struct {
-	unit         systemd.UnitState
-	unitErr      error
-	container    docker.ContainerState
-	dockerErr    error
-	dockerPolled bool
+	unit           systemd.UnitState
+	unitErr        error
+	container      docker.ContainerState
+	dockerErr      error
+	dockerPolled   bool
+	dockerRevision uint64
+}
+
+// Invalidate polling without racing with the reconciliation-owned caches.
+// An action finishing during a poll leaves a newer revision for the next poll.
+func (d *Daemon) dockerChanged(id string) {
+	d.mu.Lock()
+	d.dockerRevision[id]++
+	d.mu.Unlock()
 }
 
 // One slow systemd/Docker command must not serialize the whole 128-service
@@ -34,11 +44,15 @@ func (d *Daemon) observeServices(ctx context.Context, config model.Config) map[s
 	type job struct {
 		service    model.Service
 		pollDocker bool
+		revision   uint64
 	}
 	jobs := make(chan job, 128)
 	for _, project := range config.Projects {
 		for _, service := range project.Services {
-			jobs <- job{service: service, pollDocker: service.Docker != nil && time.Since(d.lastDockerPoll[service.ID]) >= interval}
+			d.mu.RLock()
+			revision := d.dockerRevision[service.ID]
+			d.mu.RUnlock()
+			jobs <- job{service: service, revision: revision, pollDocker: service.Docker != nil && (revision != d.dockerObservedRevision[service.ID] || time.Since(d.lastDockerPoll[service.ID]) >= interval)}
 		}
 	}
 	close(jobs)
@@ -56,10 +70,14 @@ func (d *Daemon) observeServices(ctx context.Context, config model.Config) map[s
 					return
 				}
 				unit, err := manager.Show(ctx, job.service.ID)
-				result := observation{unit: unit, unitErr: err}
+				result := observation{unit: unit, unitErr: err, dockerRevision: job.revision}
 				if job.pollDocker && ctx.Err() == nil {
 					spec := job.service.Docker
-					result.container, result.dockerErr = docker.Inspect(ctx, spec.ComposeFile, spec.ProjectName, spec.Service)
+					policy, policyErr := supervise.ForService(job.service)
+					result.dockerErr = policyErr
+					if policyErr == nil {
+						result.container, result.dockerErr = docker.Inspect(ctx, spec.ComposeFile, spec.ProjectName, spec.Service, policy)
+					}
 					result.dockerPolled = true
 				}
 				mu.Lock()

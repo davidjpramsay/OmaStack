@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "david.omastack",
   "name": "OmaStack",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "David",
   "license": "MIT",
   "description": "Your local development stack, one click away.",

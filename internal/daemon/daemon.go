@@ -34,22 +34,25 @@ type Daemon struct {
 	healthStates  *health.Registry
 	proxy         *proxy.Manager
 
-	mu             sync.RWMutex
-	operations     sync.Mutex
-	activeOpMu     sync.Mutex
-	activeOpCancel context.CancelFunc
-	snapshot       model.Snapshot
-	samplers       map[string]*monitor.Sampler
-	lastPortPoll   map[string]time.Time
-	lastDockerPoll map[string]time.Time
-	dockerStates   map[string]docker.ContainerState
-	healthRunning  map[string]uint64
-	autostartError string
-	previousStatus map[string]model.ServiceStatus
-	panelOpen      bool
-	listener       net.Listener
-	workers        chan struct{}
-	logWorkers     chan struct{}
+	mu                     sync.RWMutex
+	operations             sync.Mutex
+	activeOpMu             sync.Mutex
+	activeOpCancel         context.CancelFunc
+	snapshot               model.Snapshot
+	samplers               map[string]*monitor.Sampler
+	lastPortPoll           map[string]time.Time
+	lastDockerPoll         map[string]time.Time
+	dockerRevision         map[string]uint64
+	dockerObservedRevision map[string]uint64
+	dockerErrors           map[string]string
+	dockerStates           map[string]docker.ContainerState
+	healthRunning          map[string]uint64
+	autostartError         string
+	previousStatus         map[string]model.ServiceStatus
+	panelOpen              bool
+	listener               net.Listener
+	workers                chan struct{}
+	logWorkers             chan struct{}
 }
 
 func New(resolved paths.Paths) (*Daemon, error) {
@@ -61,19 +64,22 @@ func New(resolved paths.Paths) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{
-		paths:          resolved,
-		store:          configStore,
-		systemd:        systemd.Manager{Timeout: 30 * time.Second},
-		healthChecker:  health.NewChecker(8),
-		healthStates:   health.NewRegistry(),
-		samplers:       map[string]*monitor.Sampler{},
-		lastPortPoll:   map[string]time.Time{},
-		lastDockerPoll: map[string]time.Time{},
-		dockerStates:   map[string]docker.ContainerState{},
-		healthRunning:  map[string]uint64{},
-		previousStatus: map[string]model.ServiceStatus{},
-		workers:        make(chan struct{}, 32),
-		logWorkers:     make(chan struct{}, 2),
+		paths:                  resolved,
+		store:                  configStore,
+		systemd:                systemd.Manager{Timeout: 30 * time.Second},
+		healthChecker:          health.NewChecker(8),
+		healthStates:           health.NewRegistry(),
+		samplers:               map[string]*monitor.Sampler{},
+		lastPortPoll:           map[string]time.Time{},
+		lastDockerPoll:         map[string]time.Time{},
+		dockerRevision:         map[string]uint64{},
+		dockerObservedRevision: map[string]uint64{},
+		dockerErrors:           map[string]string{},
+		dockerStates:           map[string]docker.ContainerState{},
+		healthRunning:          map[string]uint64{},
+		previousStatus:         map[string]model.ServiceStatus{},
+		workers:                make(chan struct{}, 32),
+		logWorkers:             make(chan struct{}, 2),
 	}
 	d.proxy = proxy.New(d.resolveProxyPort)
 	return d, nil
@@ -273,11 +279,15 @@ func (d *Daemon) reconcile(ctx context.Context) {
 				if observed.dockerPolled {
 					d.lastDockerPoll[service.ID] = time.Now()
 					if observed.dockerErr != nil {
-						runtime.LastError = redact.Text(observed.dockerErr.Error(), secrets)
-						runtime.Stale = true
+						d.dockerErrors[service.ID] = redact.Text(observed.dockerErr.Error(), secrets)
 					} else {
+						delete(d.dockerErrors, service.ID)
+						d.dockerObservedRevision[service.ID] = observed.dockerRevision
 						d.dockerStates[service.ID] = observed.container
 					}
+				}
+				if message := d.dockerErrors[service.ID]; message != "" {
+					runtime.LastError, runtime.Stale = message, true
 				}
 				state := d.dockerStates[service.ID]
 				runtime.ContainerID, runtime.ContainerName = state.ID, state.Name
@@ -286,7 +296,12 @@ func (d *Daemon) reconcile(ctx context.Context) {
 				if len(state.Published) > 0 {
 					runtime.Ports = append([]int{}, state.Published...)
 				}
-				applyDockerOutcome(&runtime, state, cleanUnitStop)
+				// A cached pre-stop observation cannot override the current unit
+				// outcome. Fresh and revision-valid cached observations still
+				// expose orphaned containers between Docker polls.
+				if !cleanUnitStop || (observed.dockerRevision == d.dockerObservedRevision[service.ID] && d.dockerErrors[service.ID] == "") {
+					applyDockerOutcome(&runtime, state, cleanUnitStop)
+				}
 				if state.State == "running" {
 					runtime.History = append(runtime.History, model.MetricsPoint{At: now, CPU: runtime.CPU, MemoryMB: runtime.MemoryMB})
 					capacity := config.Settings.HistorySamples
@@ -372,11 +387,27 @@ func (d *Daemon) reconcile(ctx context.Context) {
 }
 
 func applyDockerOutcome(runtime *model.ServiceRuntime, state docker.ContainerState, cleanUnitStop bool) {
+	if runtime.Status == model.StatusCrashed && (state.State == "running" || state.State == "restarting" || state.State == "created") {
+		// A surviving Docker-owned container does not repair failed supervision.
+		return
+	}
 	switch state.State {
 	case "running":
-		runtime.Status = model.StatusRunning
+		if cleanUnitStop {
+			runtime.Status = model.StatusUnhealthy
+			runtime.LastError = "Container is running outside OmaStack supervision; stop it before editing or deleting"
+		} else {
+			runtime.Status = model.StatusRunning
+		}
 	case "restarting", "created":
-		runtime.Status = model.StatusStarting
+		if cleanUnitStop && state.State == "created" {
+			runtime.Status = model.StatusStopped
+		} else if cleanUnitStop {
+			runtime.Status = model.StatusUnhealthy
+			runtime.LastError = "Container is restarting outside OmaStack supervision"
+		} else {
+			runtime.Status = model.StatusStarting
+		}
 	case "exited", "dead":
 		if cleanUnitStop {
 			// docker compose commonly reports 137 after the supervisor forwards
@@ -507,7 +538,12 @@ func (d *Daemon) scheduleHealth(ctx context.Context, projectName string, service
 		if !state.LastChecked.IsZero() && time.Since(state.LastChecked) < time.Duration(check.IntervalSeconds)*time.Second {
 			return
 		}
-		err = d.healthChecker.Check(ctx, *check)
+		policy, policyErr := supervise.ForService(current)
+		if policyErr != nil {
+			err = policyErr
+		} else {
+			err = d.healthChecker.Check(ctx, *check, policy)
+		}
 		_, after, _, identityErr := d.currentRun(ctx, service.ID)
 		if ctx.Err() == nil && identityErr == nil && after == key {
 			next := health.Transition(state, err == nil, check.Retries, errorText(err))
